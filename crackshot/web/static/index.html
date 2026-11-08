@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crack-shot 抢票后台</title>
+<link rel="stylesheet" href="/style.css?v=2">
+</head>
+<body>
+<header>
+  <h1>🎟️ Crack-shot</h1>
+  <nav id="nav">
+    <button data-tab="overview" class="active">总览</button>
+    <button data-tab="tasks">任务</button>
+    <button data-tab="devices">设备</button>
+    <button data-tab="accounts">账号</button>
+    <button data-tab="runs">运行记录</button>
+    <button data-tab="settings">设置</button>
+  </nav>
+  <div id="clock"></div>
+</header>
+
+<main>
+<!-- 总览 -->
+<section id="tab-overview" class="tab active">
+  <div class="cards" id="ov-cards"></div>
+  <h2>即将开票</h2>
+  <div id="ov-next"></div>
+  <h2>最近运行</h2>
+  <div id="ov-runs"></div>
+  <h2>设备状态</h2>
+  <div id="ov-devices"></div>
+</section>
+
+<!-- 任务 -->
+<section id="tab-tasks" class="tab">
+  <div class="toolbar">
+    <button class="primary" onclick="openTaskForm()">＋ 新建任务</button>
+  </div>
+  <div id="task-list"></div>
+  <dialog id="task-dialog">
+    <form id="task-form" onsubmit="return submitTask(event)">
+      <h3 id="task-form-title">新建抢票任务</h3>
+      <div class="extract-box">
+        <label>从截图提取（本地模型，需 Ollama）</label>
+        <input type="file" id="extract-file" accept="image/*">
+        <button type="button" onclick="doExtract()">提取并填充</button>
+        <span id="extract-status" class="muted"></span>
+      </div>
+      <label>任务名称 <input name="name" required placeholder="如 chenxiaochun-quzhou"></label>
+      <label>演出关键词 <input name="show_name" required placeholder="详情页可见文字，如 陈小春"></label>
+      <label>开票时间（北京时间，可先留空） <input name="on_sale_at" placeholder="2026-11-28 20:00"></label>
+      <label>票档优先级（逗号分隔，按序尝试）<input name="price_tiers" required placeholder="688, 488"></label>
+      <label>绑定设备 <select name="device_id" id="task-device-select"></select></label>
+      <label>地点/城市（多城巡演用于点对城市卡片）
+        <input name="city" placeholder="如：衢州（可空）"></label>
+      <label>场次（选票页优先点匹配的场次）
+        <input name="session" placeholder="如：11-28 或 周六 19:00（可空）"></label>
+      <label>备注 <input name="note" placeholder="可选"></label>
+      <details>
+        <summary>高级参数</summary>
+        <div class="grid2">
+          <label>预热提前(分钟) <input name="prewarm_minutes" type="number" placeholder="5"></label>
+          <label>紧轮询提前(秒) <input name="arm_lead_seconds" type="number" placeholder="2"></label>
+          <label>抢票窗口(秒) <input name="max_retry_seconds" type="number" placeholder="90"></label>
+          <label>尝试上限 <input name="max_attempts" type="number" placeholder="40"></label>
+        </div>
+      </details>
+      <input type="hidden" name="task_id">
+      <div class="dialog-actions">
+        <button type="button" onclick="closeTaskForm()">取消</button>
+        <button type="submit" class="primary">保存</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="schedule-dialog">
+    <form id="schedule-form" onsubmit="return submitSchedule(event)">
+      <h3 id="schedule-title"></h3>
+      <p id="schedule-description" class="muted"></p>
+      <input type="hidden" name="task_id">
+      <input type="hidden" name="dry_run">
+      <label>确认时间（北京时间）
+        <input name="on_sale_at" required placeholder="2026-11-28 20:00:00"></label>
+      <p id="schedule-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" onclick="this.closest('dialog').close()">取消</button>
+        <button type="submit" class="primary">建立定时任务</button>
+      </div>
+    </form>
+  </dialog>
+</section>
+
+<!-- 设备 -->
+<section id="tab-devices" class="tab">
+  <h2>已注册设备</h2>
+  <div id="device-list"></div>
+  <h2>在线未注册</h2>
+  <div id="device-unregistered"></div>
+  <p class="muted">设备绑定账号后，任务即对应“谁的手机抢谁的票”；一台设备同一时刻只执行一个任务。</p>
+</section>
+
+<!-- 账号 -->
+<section id="tab-accounts" class="tab">
+  <div class="toolbar">
+    <button class="primary" onclick="openAccountForm()">＋ 新建账号</button>
+  </div>
+  <div id="account-list"></div>
+  <p class="muted">账号仅作标注（谁的大麦账号、登录在哪台手机），不保存任何密码或凭据。</p>
+  <dialog id="account-dialog">
+    <form id="account-form" onsubmit="return submitAccount(event)">
+      <h3 id="account-form-title">新建账号</h3>
+      <label>账号名称 <input name="label" required placeholder="如：我的大麦 / 老妈的号"></label>
+      <label>备注 <input name="note" placeholder="可选，如：华为机·主号"></label>
+      <input type="hidden" name="account_id">
+      <div class="dialog-actions">
+        <button type="button" onclick="closeAccountForm()">取消</button>
+        <button type="submit" class="primary">保存</button>
+      </div>
+    </form>
+  </dialog>
+</section>
+
+<!-- 运行记录 -->
+<section id="tab-runs" class="tab">
+  <div id="run-list"></div>
+</section>
+
+<!-- 设置 -->
+<section id="tab-settings" class="tab">
+  <form id="settings-form" onsubmit="return saveSettings(event)" class="settings-box">
+    <h2>全局设置</h2>
+    <label>时钟校准 clock_offset_ms <input name="clock_offset_ms" type="number"></label>
+    <label>Ollama 地址 <input name="ollama_url"></label>
+    <label>视觉模型（留空自动选择）<input name="vlm_model" list="vlm-models"></label>
+    <datalist id="vlm-models"></datalist>
+    <label>默认预热提前(分钟) <input name="default_prewarm_minutes" type="number"></label>
+    <button class="primary" type="submit">保存设置</button>
+    <span id="extractor-state" class="muted"></span>
+  </form>
+</section>
+</main>
+
+<footer>仅供本人及家人各自账号自用抢票；严禁代抢、转卖或规模化群控。</footer>
+<dialog id="confirm-dialog">
+  <h3 id="confirm-title">确认</h3>
+  <p id="confirm-message" style="white-space:pre-line"></p>
+  <div class="dialog-actions">
+    <button type="button" id="confirm-cancel">取消</button>
+    <button type="button" id="confirm-ok" class="primary danger-text">确定</button>
+  </div>
+</dialog>
+<script src="/app.js?v=5"></script>
+</body>
+</html>

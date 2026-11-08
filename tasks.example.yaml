@@ -1,0 +1,34 @@
+# 抢票任务配置示例。复制为 tasks.yaml 后修改。
+# 所有时间均为北京时间（Asia/Shanghai）。
+
+# 多台手机连电脑时必填（adb devices -l 查看）；单台可留空
+device_serial: null
+# adb 不在常见位置时手动指定；默认自动探测
+adb_path: null
+# 电脑时钟校准（毫秒）：手机比电脑快 200ms 则填 200
+clock_offset_ms: 0
+# 两次点击之间的最小间隔（毫秒），全局限速，别调太小
+min_tap_interval_ms: 80
+# 需要人工处理时是否语音播报（macOS say）
+notify_voice: true
+
+tasks:
+  - name: chenxiaochun-quzhou            # 任务名（--task 用）
+    show_name: 陈小春                    # 详情页可见的演出关键词，用于核对页面
+    on_sale_at: "2026-11-28 20:00"       # 开票时间
+    price_tiers: ["688", "488"]          # 票档优先级：匹配选票页价格文本，依次尝试
+    # 大麦App里打开演出→分享→复制链接，粘贴到这；预热时自动拉起大麦并直达详情页
+    # https 链接会自动转成 damai:// 深链，不经过浏览器
+    share_url: "https://m.damai.cn/damai/detail/item.html?itemId=xxxx&projectId=xxxx"
+    prewarm_minutes: 5                   # 开票前几分钟开始校验页面
+    arm_lead_seconds: 2                  # 开票前几秒进入紧轮询
+    max_retry_seconds: 90                # 开票后抢票窗口
+    max_attempts: 40                     # 整轮尝试上限
+    # 以下都有默认值，一般不用改
+    # poll_interval_ms: [120, 280]       # 按钮轮询抖动区间
+    # retry_backoff_ms: [400, 1200]      # 失败重试退避抖动
+    # confirm_wait_ms: [80, 160]         # 连续点击间隔抖动
+    # queue_wait_seconds: 60             # 排队页最长等待
+    # buy_texts: [立即预订, 立即购买]     # 可购买按钮文案（大麦改版时调整）
+    # wait_texts: [即将开抢, 缺货登记, 即将开售, 暂无余票, 已结束, 已售罄]
+    # captcha_texts: [请完成验证, 滑动验证, 拖动滑块, 验证码, 安全验证]
