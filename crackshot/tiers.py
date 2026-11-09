@@ -90,10 +90,13 @@ def reconcile_with_tags(layout: Dict[str, Any], device) -> Dict[str, Any]:
     对齐（±90px）即缺货，否则视为有票。
     """
     tags = device.find_all(["缺货登记"])
-    tag_ys = [t.center[1] for t in tags]
-    for tier in layout["tiers"]:
-        tier["in_stock"] = not any(abs(tier["y"] - ty) < 90 for ty in tag_ys)
-    layout["tag_ys"] = tag_ys
+    for tag in tags:
+        tx, ty = tag.center
+        candidates = [tier for tier in layout["tiers"] if 0 <= tx - tier["x"] < 350
+                      and abs(tier["y"] - ty) < 90]
+        if candidates:
+            nearest = min(candidates, key=lambda tier: (tx - tier["x"]) ** 2 + (ty - tier["y"]) ** 2)
+            nearest["in_stock"] = False
     return layout
 
 
@@ -101,6 +104,8 @@ def pick_tier(tiers: List[Dict[str, Any]], wanted: List[str]) -> Optional[Dict[s
     """按用户票档优先级选第一个有货的票档；都没有货返回 None。"""
     for price in wanted:
         digits = re.sub(r"\D", "", str(price))
+        if not digits:
+            continue
         for tier in tiers:
             if re.sub(r"\D", "", str(tier.get("price", ""))) == digits and tier.get("in_stock"):
                 return tier

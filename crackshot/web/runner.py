@@ -20,7 +20,9 @@ from ..adb import Adb, find_adb
 from ..config import GlobalConfig
 from ..device import Device
 from ..notify import Notifier
+from ..reservation import ReservationUnavailable, read_reservation
 from ..scheduler import TaskRunner
+from ..show_details import inspect_show_details
 from ..timeutil import LOCAL_TZ, now_ms
 from . import db
 
@@ -238,7 +240,7 @@ class RunManager:
         return run_id
 
     def _calibrate_worker(self, run_id: int, task: dict, serial: str) -> None:
-        from ..navigator import navigate_to_detail
+        from ..navigator import is_target_detail, navigate_to_detail
         from ..scheduler import read_page_sell_time
         run_token = CURRENT_RUN.set(run_id)
         task_token = CURRENT_TASK.set(task["id"])
@@ -255,10 +257,32 @@ class RunManager:
             if not navigate_to_detail(adb, dev, task_cfg):
                 raise RuntimeError("导航到详情页失败，请检查演出关键词/城市")
             page_time = read_page_sell_time(dev, task_cfg.city or None)
+            if not is_target_detail(dev, task_cfg):
+                raise RuntimeError("读取时已离开目标演出详情页，请重新校准")
+            report = inspect_show_details(dev, task_cfg)
+            fields = {}
+            if page_time is not None:
+                try:
+                    session, price = read_reservation(adb, dev, task_cfg, db.get_settings(), page_time)
+                    fields.update(session=session, price_tiers=[price])
+                    report.update(target_date=session, reservation_session=session,
+                                  reservation_price=price, mismatch=False,
+                                  date_check="已核对预约场次", price_check="已核对预约票档")
+                    db.add_event(task["id"], run_id, "success",
+                                 f"预约页已核对并填写：{session}，¥{price}")
+                except ReservationUnavailable as exc:
+                    report["reservation_error"] = str(exc)
+                    db.add_event(task["id"], run_id, "warn", f"预约核对：{exc}")
+            db.add_event(task["id"], run_id, "warn" if report["mismatch"] else "info",
+                         f"目标演出日期：{fields.get('session', task_cfg.session) or '未填'}，"
+                         f"页面演出日期：{report['page_date'] or '未读到'}，{report['date_check']}。"
+                         f"目标票档：{'、'.join(fields.get('price_tiers', task_cfg.price_tiers))}，"
+                         f"页面票价：{report['page_price'] or '未读到'}，{report['price_check']}。")
             if page_time is None:
+                db.update_task(task["id"], {"calibration": report})
                 raise RuntimeError("详情页未读到开售时间（可能已开票或无倒计时）")
             calibrated_at = format_time(page_time)
-            fields = {"calibrated_at": calibrated_at}
+            fields.update(calibrated_at=calibrated_at, calibration=report)
             if task["status"] not in SCHEDULED_STATUSES:
                 fields["status"] = "ready"
             db.update_task(task["id"], fields)
@@ -324,8 +348,7 @@ class RunManager:
             outcome = "error"
         finally:
             db.finish_run(run_id, outcome, attempts)
-            final_status = {"success": "success", "needs_human": "needs_human"}.get(
-                outcome, outcome if outcome in ("cancelled",) else "failed")
+            final_status = outcome if outcome in ("success", "needs_human", "sold_out", "cancelled") else "failed"
             if dry_run:
                 final_status = task["status"] if manual else (
                     "ready" if task["calibrated_at"] else "draft")

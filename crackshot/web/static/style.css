@@ -47,7 +47,7 @@ tr:last-child td { border-bottom: none; }
 .badge.prewarming, .badge.grabbing { color: var(--warn); background: rgba(255,167,38,.12); }
 .badge.success { color: var(--ok); background: rgba(102,187,106,.12); }
 .badge.needs_human, .badge.conflict, .badge.error { color: var(--err); background: rgba(239,83,80,.12); }
-.badge.failed, .badge.timeout, .badge.cancelled, .badge.waiting_device { color: var(--warn); }
+.badge.failed, .badge.timeout, .badge.cancelled, .badge.waiting_device, .badge.sold_out { color: var(--warn); }
 .badge.dry { color: var(--muted); }
 
 button {
@@ -98,3 +98,9 @@ summary { cursor: pointer; }
 footer { text-align: center; color: var(--muted); font-size: 12px; padding: 26px 0 34px; }
 .empty { color: var(--muted); padding: 18px; text-align: center; background: var(--panel); border-radius: 10px; }
 .row-actions { display: flex; gap: 6px; }
+#task-list .row-actions { flex-wrap: wrap; }
+#task-list .row-actions button, #task-list .badge { white-space: nowrap; }
+#task-schedule-result {
+  padding: 8px 12px; border-left: 3px solid var(--ok); border-radius: 4px;
+  background: rgba(102,187,106,.12); color: var(--ok);
+}

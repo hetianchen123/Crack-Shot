@@ -15,6 +15,7 @@ from crackshot.config import TaskConfig
 from crackshot.timeutil import parse_local
 from crackshot.web import db, runner
 from crackshot.web.app import create_app
+from crackshot.reservation import ReservationUnavailable
 
 SHOW = "示例巡演"
 SALE = "2026-11-09 15:00:00"
@@ -105,6 +106,7 @@ class SchedulingTests(unittest.TestCase):
             patch.object(runner, "Device", side_effect=lambda *args: device_with_xml(self.xml)),
             patch.object(self.manager, "scan_devices", return_value={"fake-phone": ""}),
             patch.object(navigator, "navigate_to_detail", side_effect=self.navigate),
+            patch.object(runner, "read_reservation", side_effect=ReservationUnavailable("模拟详情页未提供入口")),
             patch.object(runner, "WebNotifier", side_effect=lambda *args:
                          SimpleNamespace(info=lambda _: None, critical=lambda _: None)),
         ]
@@ -135,7 +137,8 @@ class SchedulingTests(unittest.TestCase):
                          if self.now < SALE_MS else
                          node("立即预订", "purchase_status_bar", "[600,2000][1000,2250]"))
             return node(children=node(f"{SHOW} · 杭州站", "info_v2_title", "[10,50][900,200]")
-                        + countdown)
+                        + countdown + node("2026.11.28-11.29 约120分钟", "info_v2_time_and_duration_tv")
+                        + node("488", "info_v2_price_left") + node("888", "info_v2_price_right"))
         return node("请完成验证" if self.state == "captcha" else "首页")
 
     def adb(self):
@@ -180,16 +183,16 @@ class SchedulingTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail("调度线程没有结束")
 
-    def create_draft(self):
+    def create_draft(self, session="2026-11-28", price_tiers=None, expected=201):
         return self.request("POST", "/api/tasks", {
-            "name": "测试", "show_name": SHOW, "city": "杭州", "session": "11-28",
-            "device_id": self.device_id, "price_tiers": ["688"],
-        }, 201)["id"]
+            "name": "测试", "show_name": SHOW, "city": "杭州", "session": session,
+            "device_id": self.device_id, "price_tiers": price_tiers or ["688"],
+        }, expected).get("id")
 
     def test_create_calibrate_confirm_and_click_at_sale(self):
         tid = self.create_draft()
         task = self.request("GET", f"/api/tasks/{tid}")
-        self.assertEqual((task["status"], task["city"], task["session"]), ("draft", "杭州", "11-28"))
+        self.assertEqual((task["status"], task["city"], task["session"]), ("draft", "杭州", "2026-11-28"))
         self.request("POST", f"/api/tasks/{tid}/schedule", {"on_sale_at": SALE}, 409)
         self.manager._tick()
         self.assertEqual(db.list_runs(task_id=tid), [])
@@ -199,6 +202,9 @@ class SchedulingTests(unittest.TestCase):
         self.assertEqual(self.wait_run(tid)["outcome"], "calibrated")
         task = self.request("GET", f"/api/tasks/{tid}")
         self.assertEqual((task["status"], task["calibrated_at"], task["on_sale_at"]), ("ready", SALE, ""))
+        self.assertEqual(task["calibration"]["page_date"], "2026-11-28 至 2026-11-29")
+        self.assertEqual(task["calibration"]["page_price"], "¥488–¥888")
+        self.assertFalse(task["calibration"]["mismatch"])
         self.now += 86_400_000
         self.manager._tick()
         self.assertEqual(len(db.list_runs(task_id=tid)), 1)
@@ -222,6 +228,45 @@ class SchedulingTests(unittest.TestCase):
         self.assertEqual([t[0] for t in self.taps], [SALE_MS])
         self.manager._tick()
         self.assertEqual(len(db.list_runs(task_id=tid)), 2)
+
+    def test_calibration_reports_mismatch_and_blocks_formal_schedule(self):
+        self.create_draft(session="", expected=400)
+        self.create_draft(price_tiers=["票价待定"], expected=400)
+        self.create_draft(price_tiers=["688", "788"], expected=400)
+        tid = self.create_draft(session="2026-11-30", price_tiers=["988"])
+        self.now -= 86_400_000
+        self.request("POST", f"/api/tasks/{tid}/calibrate")
+        self.assertEqual(self.wait_run(tid)["outcome"], "calibrated")
+        result = self.request("GET", f"/api/tasks/{tid}")["calibration"]
+        self.assertTrue(result["mismatch"])
+        self.assertIn("预填日期与页面不符", result["date_check"])
+        self.assertIn("¥988", result["price_check"])
+        self.request("POST", f"/api/tasks/{tid}/schedule", {"on_sale_at": SALE}, 409)
+
+    def test_calibration_uses_the_actual_reserved_date_and_price(self):
+        tid = self.create_draft(session="2026-11-29", price_tiers=["888"])
+        self.now -= 86_400_000
+        with patch.object(runner, "read_reservation", return_value=("2026-11-28 19:30", "588")):
+            self.request("POST", f"/api/tasks/{tid}/calibrate")
+            self.assertEqual(self.wait_run(tid)["outcome"], "calibrated")
+        task = self.request("GET", f"/api/tasks/{tid}")
+        self.assertEqual((task["session"], task["price_tiers"]), ("2026-11-28 19:30", ["588"]))
+        self.assertEqual(task["calibration"]["reservation_price"], "588")
+
+    def test_selecting_target_date_does_not_use_tiers_from_previous_date(self):
+        task = TaskConfig("test", SHOW, SALE, ["688"], session="2026-11-28")
+        dev = device_with_xml(lambda: node("票档"))
+        adb = self.adb()
+        adb.screencap_bytes = lambda: b"test"
+        layout = {"sessions": [
+            {"text": "2026-11-29 周日 19:30", "selected": True, "x": 400, "y": 700},
+            {"text": "2026.11.28 周六 19:30", "selected": False, "x": 400, "y": 500},
+        ], "tiers": [{"price": "688", "in_stock": True, "x": 400, "y": 1200}]}
+        instance = grabber.Grabber(adb, dev, task, SimpleNamespace(), Path(self.tmp.name),
+                                   tier_parser=lambda *_: layout)
+        self.assertIsNone(instance._from_tier_sheet())
+        self.assertEqual(len(self.taps), 1)
+        self.assertLess(self.taps[0][1][1], 600)
 
     def test_timed_rehearsal_does_not_click_or_requeue(self):
         tid = self.create_draft()
@@ -258,7 +303,7 @@ class SchedulingTests(unittest.TestCase):
         notifier = SimpleNamespace(critical=lambda _: None)
         instance = grabber.Grabber(adb, dev, task, notifier, Path(self.tmp.name),
                                    tier_parser=lambda *_: self.fail("不应解析缺货登记页"))
-        self.assertEqual(instance.run(SALE_MS, verify_detail=True), "needs_human")
+        self.assertEqual(instance.run(SALE_MS, verify_detail=True), "sold_out")
         self.assertEqual(probe_times, [SALE_MS - 750])
         self.assertEqual([tap[0] for tap in self.taps], [SALE_MS + 100])
         self.assertEqual(backs, [])
@@ -273,7 +318,7 @@ class SchedulingTests(unittest.TestCase):
         dev = device_with_xml(xml)
         instance = grabber.Grabber(self.adb(), dev, task, SimpleNamespace(),
                                    Path(self.tmp.name), stop_check=lambda: self.now > SALE_MS + 300)
-        self.assertEqual(instance.run(SALE_MS, verify_detail=True), "cancelled")
+        self.assertEqual(instance.run(SALE_MS, verify_detail=True), "sold_out")
         self.assertEqual(self.taps, [])
 
     def test_calibration_never_overwrites_existing_device_owner(self):

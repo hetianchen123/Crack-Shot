@@ -16,7 +16,7 @@ tasks:
   - name: chenxiaochun-quzhou            # 任务名（--task 用）
     show_name: 陈小春                    # 详情页可见的演出关键词，用于核对页面
     on_sale_at: "2026-11-28 20:00"       # 开票时间
-    price_tiers: ["688", "488"]          # 票档优先级：匹配选票页价格文本，依次尝试
+    price_tiers: ["688"]                 # 只填写已预约的一个票档
     # 大麦App里打开演出→分享→复制链接，粘贴到这；预热时自动拉起大麦并直达详情页
     # https 链接会自动转成 damai:// 深链，不经过浏览器
     share_url: "https://m.damai.cn/damai/detail/item.html?itemId=xxxx&projectId=xxxx"

@@ -24,12 +24,14 @@ const api = {
 
 const STATUS_LABEL = {
   draft: "草稿", ready: "校准待确认",
-  scheduled: "待执行", prewarming: "预热中", grabbing: "抢票中", success: "成功",
+  scheduled: "已排程", prewarming: "预热中", grabbing: "抢票中", success: "成功",
   needs_human: "需人工", failed: "失败", timeout: "超时", cancelled: "已取消",
+  sold_out: "缺货",
   conflict: "设备冲突", waiting_device: "等设备", error: "异常",
 };
 const OUTCOME_LABEL = {
   success: "下单成功", needs_human: "需人工", timeout: "窗口超时", off_page: "离开页面",
+  sold_out: "缺货",
   cancelled: "已取消", error: "异常", calibrated: "校准完成",
   guard_verified: "守护演练通过", "": "运行中",
 };
@@ -37,6 +39,7 @@ const OUTCOME_LABEL = {
 let devicesCache = [];
 let accountsCache = [];
 let tasksCache = new Map();
+let tasksRequest = 0;
 
 /* ---------- 原生 alert/confirm 的页内替代（内嵌浏览器里原生对话框不可靠） ---------- */
 
@@ -123,7 +126,8 @@ async function renderOverview() {
       <td>${esc(t.device_serial || "未绑定")}${t.account_label ? ` / ${esc(t.account_label)}` : ""}</td>
       <td class="mono">${esc(t.on_sale_at)}</td>
       <td class="mono">${countdown(t.on_sale_at)}</td>
-      <td>${badge(t.status, STATUS_LABEL[t.status] || t.status)}</td>
+      <td>${badge(t.status, t.scheduled_dry_run && t.status === "scheduled"
+        ? "定时演练已排程" : STATUS_LABEL[t.status] || t.status)}</td>
     </tr>`).join("")}</table>` : `<div class="empty">没有待开票任务</div>`;
 
   $("#ov-runs").innerHTML = data.runs.length ? `<table>
@@ -149,9 +153,28 @@ async function renderOverview() {
 
 /* ---------- 任务 ---------- */
 
+function scheduleMode(task) {
+  if (!task?.prewarm_at) return null;
+  return task.scheduled_dry_run ? "rehearsal" : "formal";
+}
+
+function taskStatus(task, mode) {
+  if (mode && !task.enabled) return badge("cancelled", "排程已暂停");
+  if (!mode && task.status === "scheduled") return badge("failed", "排程时间无效");
+  const status = badge(task.status, STATUS_LABEL[task.status] || task.status);
+  if (!mode) return status;
+  const scheduled = badge("scheduled", mode === "rehearsal" ? "定时演练已排程" : "已排程");
+  return task.status === "scheduled" ? scheduled : `${scheduled}<br>${status}`;
+}
+
+function priceList(task) {
+  return task.price_tiers.length === 1 ? `¥${task.price_tiers[0]}` : "待确认预约票档";
+}
+
 async function renderTasks() {
+  const request = ++tasksRequest;
   const [tasks, devices] = await Promise.all([api.get("/api/tasks"), api.get("/api/devices")]);
-  tasksCache = new Map(tasks.map((t) => [t.id, t]));
+  if (request !== tasksRequest) return;
   devicesCache = devices.devices;
   const deviceOptions = ['<option value="">未绑定</option>']
     .concat(devices.devices.map((d) =>
@@ -161,26 +184,38 @@ async function renderTasks() {
   const prev = sel.value;
   sel.innerHTML = deviceOptions;
   if (prev) sel.value = prev;
+  renderTaskRows(tasks);
+}
 
+function renderTaskRows(tasks) {
+  tasksCache = new Map(tasks.map((t) => [t.id, t]));
   $("#task-list").innerHTML = tasks.length ? `<table>
-    <tr><th>任务</th><th>演出</th><th>开票</th><th>票档</th><th>设备/账号</th><th>状态</th><th>操作</th></tr>
-    ${tasks.map((t) => `<tr>
+    <tr><th>任务</th><th>演出与日期</th><th>开票</th><th>预约票档</th><th>设备/账号</th><th>状态</th><th>操作</th></tr>
+    ${tasks.map((t) => {
+      const mode = scheduleMode(t);
+      const check = t.calibration || {};
+      return `<tr>
       <td>${esc(t.name)} ${t.enabled ? "" : badge("", "停用")}</td>
-      <td>${esc(t.show_name)}${t.city ? ` · ${esc(t.city)}` : ""}</td>
+      <td>${esc(t.show_name)}${t.city ? ` · ${esc(t.city)}` : ""}
+        <br><span class="muted">目标日期 ${esc(check.target_date || t.session || "未填写")}</span>
+        ${check.date_check ? `<br><span class="muted">页面日期 ${esc(check.page_date || "未读到")}</span>
+          <br><span class="muted">${esc(check.date_check)}</span>` : ""}</td>
       <td class="mono">${esc(t.on_sale_at || "未确认")}
-        ${t.prewarm_at ? `<br><span class="muted">预热 ${esc(t.prewarm_at)}（${countdown(t.on_sale_at)}）</span>` : ""}
+        ${mode ? `<br><span class="muted">预热时间 ${esc(t.prewarm_at)}</span>` : ""}
         ${t.calibrated_at ? `<br><span class="muted">页面校准 ${esc(t.calibrated_at)}</span>` : ""}</td>
-      <td class="mono">${t.price_tiers.map(esc).join(" → ")}</td>
+      <td class="mono">${esc(priceList(t))}
+        ${check.price_check ? `<br><span class="muted">页面票价 ${esc(check.page_price || "未读到")}</span>
+          <br><span class="muted">${esc(check.price_check)}</span>` : ""}
+        ${check.reservation_error ? `<br><span class="muted">${esc(check.reservation_error)}</span>` : ""}</td>
       <td>${esc(t.device_serial || "未绑定")}${t.account_label ? `<br><span class="muted">${esc(t.account_label)}</span>` : ""}</td>
-      <td>${badge(t.status, STATUS_LABEL[t.status] || t.status)}
-        ${t.prewarm_at && t.scheduled_dry_run ? badge("dry", "定时演练") : ""}</td>
+      <td>${taskStatus(t, mode)}${check.mismatch ? `<br>${badge("error", "核对有差异")}` : ""}</td>
       <td><div class="row-actions">
         ${!["prewarming", "grabbing"].includes(t.status) && t.enabled && t.device_id ?
           `<button class="small" onclick="calibrateTask(${t.id})">校准</button>
-           ${t.calibrated_at ? `<button class="small primary" onclick="openSchedule(${t.id}, false)">确认开抢时间并排程</button>` : ""}
-           ${!t.prewarm_at || t.scheduled_dry_run ? `<button class="small" onclick="openSchedule(${t.id}, true)">定时演练</button>` : ""}
+           ${t.calibrated_at && t.session && t.price_tiers.length === 1 && !check.mismatch ? `<button class="small${mode === "formal" ? "" : " primary"}" onclick="openSchedule(${t.id}, false)">${mode === "formal" ? "修改排程" : "确认开抢时间并排程"}</button>` : ""}
+           ${mode !== "formal" ? `<button class="small" onclick="openSchedule(${t.id}, true)">${mode === "rehearsal" ? "修改演练" : "定时演练"}</button>` : ""}
            <button class="small" onclick="runTask(${t.id}, true)">立即演练</button>
-           ${t.prewarm_at && !t.scheduled_dry_run ? `<button class="small" onclick="runTask(${t.id}, false)">立即执行</button>` : ""}` : ""}
+           ${mode === "formal" && t.price_tiers.length === 1 ? `<button class="small" onclick="runTask(${t.id}, false)">立即执行</button>` : ""}` : ""}
         ${["prewarming", "grabbing"].includes(t.status) ?
           `<button class="small danger" onclick="cancelTask(${t.id})">停止</button>` : ""}
         <button class="small" onclick="openTaskForm(tasksCache.get(${t.id}))">编辑</button>
@@ -188,7 +223,8 @@ async function renderTasks() {
         <button class="small" onclick="toggleTask(${t.id}, ${t.enabled ? 0 : 1})">${t.enabled ? "停用" : "启用"}</button>
         <button class="small danger" onclick="deleteTask(${t.id})">删除</button>
       </div></td>
-    </tr>`).join("")}</table>` : `<div class="empty">还没有任务，点「新建任务」创建</div>`;
+    </tr>`;
+    }).join("")}</table>` : `<div class="empty">还没有任务，点「新建任务」创建</div>`;
 }
 
 function openTaskForm(task) {
@@ -202,7 +238,7 @@ function openTaskForm(task) {
     form.name.value = task.name;
     form.show_name.value = task.show_name;
     form.on_sale_at.value = task.on_sale_at;
-    form.price_tiers.value = task.price_tiers.join(", ");
+    form.price_tiers.value = task.price_tiers.length === 1 ? task.price_tiers[0] : "";
     form.note.value = task.note || "";
     form.city.value = task.city || "";
     form.session.value = task.session || "";
@@ -236,7 +272,7 @@ async function submitTask(ev) {
     name: form.name.value.trim(),
     show_name: form.show_name.value.trim(),
     on_sale_at: form.on_sale_at.value.trim(),
-    price_tiers: form.price_tiers.value.split(/[,，\s]+/).filter(Boolean),
+    price_tiers: [form.price_tiers.value.trim()],
     device_id: form.device_id.value ? Number(form.device_id.value) : null,
     options,
     note: form.note.value.trim(),
@@ -283,7 +319,7 @@ async function runTask(id, dryRun) {
 }
 
 async function calibrateTask(id) {
-  if (!(await confirm("立即校准？将导航到演出详情页读取开售时间，等你确认后再排程。"))) return;
+  if (!(await confirm("立即校准？会从详情页进入「已预约」，读取已勾选的场次、票档及开售时间。"))) return;
   try {
     const r = await api.post(`/api/tasks/${id}/calibrate`);
     showRun(r.run_id);
@@ -297,13 +333,18 @@ function openSchedule(id, dryRun) {
   form.task_id.value = id;
   form.dry_run.value = dryRun ? "1" : "0";
   const prewarm = task.prewarm_minutes;
+  const updating = scheduleMode(task) === (dryRun ? "rehearsal" : "formal");
   const testTime = new Date(Date.now() + (prewarm + 1) * 60000 + 8 * 3600000)
     .toISOString().slice(0, 19).replace("T", " ");
-  form.on_sale_at.value = dryRun ? testTime : (task.calibrated_at || task.on_sale_at);
-  $("#schedule-title").textContent = `${dryRun ? "建立定时演练" : "确认开抢时间"} · ${task.name}`;
+  form.on_sale_at.value = updating ? task.on_sale_at :
+    (dryRun ? testTime : (task.calibrated_at || task.on_sale_at));
+  const title = dryRun ? (updating ? "修改定时演练" : "建立定时演练") :
+    (updating ? "修改正式排程" : "确认开抢时间");
+  $("#schedule-title").textContent = `${title} · ${task.name}`;
+  form.querySelector("[type=submit]").textContent = updating ? "保存排程修改" : "建立定时任务";
   $("#schedule-description").textContent = dryRun
     ? `提前 ${prewarm} 分钟进入目标页守护，到演练时间核对页面，不点击购买按钮。`
-    : `提前 ${prewarm} 分钟启动并守护目标页，开票后检测到可购买即点击。`;
+    : `目标演出 ${task.calibration?.target_date || task.session}，票档 ${priceList(task)}。提前 ${prewarm} 分钟预热。页面开票时间 ${task.calibrated_at}。`;
   $("#schedule-error").textContent = "";
   $("#schedule-dialog").showModal();
 }
@@ -312,13 +353,22 @@ async function submitSchedule(ev) {
   ev.preventDefault();
   const form = ev.target;
   const submit = form.querySelector("[type=submit]");
+  const id = Number(form.task_id.value);
+  const dryRun = form.dry_run.value === "1";
+  const updating = scheduleMode(tasksCache.get(id)) === (dryRun ? "rehearsal" : "formal");
   submit.disabled = true;
+  $("#schedule-error").textContent = "";
   try {
-    await api.post(`/api/tasks/${form.task_id.value}/schedule`, {
-      on_sale_at: form.on_sale_at.value.trim(), dry_run: form.dry_run.value === "1",
+    const saved = await api.post(`/api/tasks/${id}/schedule`, {
+      on_sale_at: form.on_sale_at.value.trim(), dry_run: dryRun,
     });
+    ++tasksRequest; // 作废保存前发出的列表请求。
+    renderTaskRows([...tasksCache.values()].map((task) =>
+      task.id === id ? { ...task, ...saved } : task));
+    const result = $("#task-schedule-result");
+    result.textContent = `${saved.name} · ${dryRun ? "定时演练" : "正式排程"}已${updating ? "更新" : "建立"}。预热 ${saved.prewarm_at}，${dryRun ? "演练" : "开抢"} ${saved.on_sale_at}（北京时间）。`;
+    result.hidden = false;
     $("#schedule-dialog").close();
-    await renderTasks();
   } catch (e) {
     $("#schedule-error").textContent = e.message;
   } finally { submit.disabled = false; }
@@ -348,7 +398,14 @@ async function doExtract() {
     if (!form.name.value) form.name.value = draft.show_name || "new-task";
     if (draft.show_name) form.show_name.value = draft.show_name;
     if (draft.on_sale_guess) form.on_sale_at.value = draft.on_sale_guess;
-    if (draft.price_tiers.length) form.price_tiers.value = draft.price_tiers.join(", ");
+    if (draft.price_tiers.length === 1) form.price_tiers.value = draft.price_tiers[0];
+    const dates = [...new Set(draft.sessions.map((session) => {
+      const m = session.match(/(\d{4})[-./年](\d{1,2})[-./月](\d{1,2})/);
+      return m && [m[1], m[2].padStart(2, "0"), m[3].padStart(2, "0")].join("-");
+    }).filter(Boolean))];
+    if (!form.session.value && dates.length === 1 && draft.sessions.length === 1) {
+      form.session.value = dates[0];
+    }
     const extra = [
       draft.full_title && `完整标题: ${draft.full_title}`,
       draft.sessions.length && `场次: ${draft.sessions.join(" / ")}`,
@@ -489,7 +546,8 @@ async function renderRuns() {
 async function showRun(runId) {
   const data = await api.get(`/api/runs/${runId}`);
   const dlg = document.createElement("dialog");
-  dlg.innerHTML = `
+  function render(data) {
+    dlg.innerHTML = `
     <h3>运行 #${data.run.id} · ${esc(data.run.task_name)}
       ${badge(data.run.outcome || "running", OUTCOME_LABEL[data.run.outcome] || data.run.outcome || "运行中")}
       ${data.run.dry_run ? badge("dry", "演练") : ""}</h3>
@@ -503,9 +561,24 @@ async function showRun(runId) {
     <ul class="timeline">${data.events.map((e) =>
       `<li class="${e.level}"><time>${esc(e.ts.slice(11))}</time>${esc(e.message)}</li>`).join("")}</ul>
     <div class="dialog-actions"><button onclick="this.closest('dialog').close()">关闭</button></div>`;
+  }
+  async function follow() {
+    if (!dlg.open) return;
+    try {
+      const current = await api.get(`/api/runs/${runId}`);
+      if (!dlg.open) return;
+      render(current);
+      if (current.run.finished_at) return;
+    } catch (e) {
+      console.error("运行记录刷新失败", e);
+    }
+    setTimeout(follow, 2000);
+  }
+  render(data);
   document.body.appendChild(dlg);
   dlg.showModal();
   dlg.addEventListener("close", () => dlg.remove());
+  if (!data.run.finished_at) setTimeout(follow, 2000);
 }
 
 async function showTaskEvents(taskId) {

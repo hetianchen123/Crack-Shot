@@ -25,6 +25,7 @@ class Element:
     description: str = ""
     clazz: str = ""
     parent: Optional["Element"] = field(default=None, repr=False, compare=False)
+    checked: bool = False
 
     @property
     def center(self) -> Tuple[int, int]:
@@ -60,7 +61,10 @@ def _parse_nodes(xml: str) -> List[Element]:
                              attrs.get("clickable") == "true",
                              attrs.get("enabled") == "true",
                              attrs.get("resource-id", ""), attrs.get("content-desc", ""),
-                             attrs.get("class", ""), parent)
+                             attrs.get("class", ""), parent,
+                             attrs.get("checked") == "true" and
+                             (attrs.get("checkable") == "true"
+                              or "checkbox" in attrs.get("class", "").lower()))
             nodes.append(parent)
         for child in xml_node:
             visit(child, parent)
@@ -130,10 +134,7 @@ class Device:
 
     def has_checked_checkbox(self) -> bool:
         """是否存在勾选中的复选框（观演人预选检测；属性顺序不定双向匹配）。"""
-        import re
-        xml = self._d.dump_hierarchy()
-        return bool(re.search(r'checkbox[^>]*checked="true"', xml)
-                    or re.search(r'checked="true"[^>]*checkbox', xml))
+        return any(node.checked for node in self._snapshot())
 
     def find_all(self, texts: List[str]) -> List[Element]:
         """按精确文字匹配全部控件（如所有「缺货登记」标签）。"""

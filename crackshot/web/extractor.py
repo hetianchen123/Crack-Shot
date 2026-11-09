@@ -91,7 +91,7 @@ def extract(image_bytes: bytes, ollama_url: str, configured_model: str,
         "show_name": str(parsed.get("show_name") or "").strip()[:30],
         "full_title": str(parsed.get("full_title") or "").strip()[:120],
         "on_sale_text": on_sale_text,
-        "on_sale_guess": _guess_datetime(on_sale_text, sessions),
+        "on_sale_guess": _guess_datetime(on_sale_text),
         "sessions": sessions,
         "price_tiers": tiers,
         "venue": str(parsed.get("venue") or "").strip()[:60],
@@ -125,14 +125,11 @@ def _clean_tiers(raw: Any) -> List[str]:
     return tiers[:12]
 
 
-def _guess_datetime(on_sale_text: str, sessions: List[str]) -> str:
-    """尽力从开售文字/场次里猜 YYYY-MM-DD HH:MM；猜不到返回空串让人工填。"""
-    text = f"{on_sale_text} {' '.join(sessions)}"
-    md = re.search(r"(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})日?", text)
-    hm = re.search(r"(\d{1,2}):(\d{2})", text)
-    if not md:
+def _guess_datetime(on_sale_text: str) -> str:
+    """只从明确的开售文字提取开票时间。"""
+    md = re.search(r"(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})日?", on_sale_text)
+    hm = re.search(r"(\d{1,2}):(\d{2})", on_sale_text)
+    if not md or not hm:
         return ""
     date = f"{int(md.group(1)):04d}-{int(md.group(2)):02d}-{int(md.group(3)):02d}"
-    if hm:
-        return f"{date} {int(hm.group(1)):02d}:{hm.group(2)}"
-    return date
+    return f"{date} {int(hm.group(1)):02d}:{hm.group(2)}"

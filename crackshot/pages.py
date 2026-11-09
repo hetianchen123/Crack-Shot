@@ -20,6 +20,7 @@ class PageState(Enum):
     STOCK_REGISTRATION = "stock_registration"  # 缺货登记页，与正常选票页共用票档布局
     TIER_SHEET = "tier_sheet"        # 选票浮层（场次/票档/确定）
     ORDER_CONFIRM = "order_confirm"  # 确认订单页（观演人/提交订单）
+    ORDER_RETRY = "order_retry"      # 提交拥挤弹窗，明确允许继续尝试
     QUEUE = "queue"                  # 排队中
     SUCCESS = "success"              # 下单成功/待支付
     ERROR_DIALOG = "error_dialog"    # 失败/售罄等提示弹窗
@@ -41,8 +42,12 @@ class PageSnapshot:
 TIER_SHEET_MARKERS = ["票档", "每笔订单限购", "先到先得"]
 # 订单确认页提交按钮：实测文案为'立即提交'（旧版本为'提交订单'）
 SUBMIT_TEXTS = ["立即提交", "提交订单"]
+ORDER_RETRY_TEXTS = ["继续尝试"]
+SOLD_OUT_TEXTS = ["缺货登记", "已售罄", "暂无余票", "暂时无票"]
 QUEUE_MARKERS = ["排队中", "正在排队", "前方排队"]
+SUBMIT_PENDING_MARKERS = ["正在提交订单", "订单提交中", "正在提交", "请勿重复提交"]
 SUCCESS_MARKERS = ["订单提交成功", "立即支付", "支付剩余时间", "去支付"]
+PAYMENT_LABELS = ["待支付", "确认支付", "收银台"]
 # 详情页判定必须用详情页独有控件 id——搜索结果页的卡片同样带有
 # 演出名/「缺货登记」/「开抢」文字，靠文字会误判（真机踩坑）。
 # 单站详情页：info_v2_title（标题）/ purchase_status_bar（底部购买栏）；
@@ -62,15 +67,25 @@ def _is_detail_page(device: Device) -> Optional[str]:
 def recognize(device: Device, task: TaskConfig) -> PageSnapshot:
     if device.exists_contains_any(task.captcha_texts):
         return PageSnapshot(PageState.CAPTCHA, "验证码关键词")
+    if device.exists_contains_any(SUCCESS_MARKERS):
+        return PageSnapshot(PageState.SUCCESS, _hit_contains(device, SUCCESS_MARKERS))
+    payment = _hit(device, PAYMENT_LABELS)
+    if payment:
+        return PageSnapshot(PageState.SUCCESS, payment)
+    if (device.find(["提交缺货登记"])
+            or device.exists_contains_any(["暂时无票，若到货", "若始终缺货，将不再另外通知"])):
+        return PageSnapshot(PageState.STOCK_REGISTRATION, "缺货登记页")
+    retry = device.find(ORDER_RETRY_TEXTS)
+    if retry and (device.find(["返回重新选购"]) or device.find(SUBMIT_TEXTS)):
+        return PageSnapshot(PageState.ORDER_RETRY, "继续尝试")
     # 失败提示多为长文案（contains），但必须同时存在弹窗按钮才按弹窗处理，
     # 否则“已售罄”这类详情页按钮文字会被误判成失败弹窗
     err_hit = _hit_contains(device, task.error_texts)
     if err_hit and device.find(task.error_button_texts):
         return PageSnapshot(PageState.ERROR_DIALOG, err_hit)
-    if device.exists_contains_any(SUCCESS_MARKERS):
-        return PageSnapshot(PageState.SUCCESS, _hit_contains(device, SUCCESS_MARKERS))
-    if device.exists_contains_any(QUEUE_MARKERS):
-        return PageSnapshot(PageState.QUEUE, _hit_contains(device, QUEUE_MARKERS))
+    pending = _hit_contains(device, QUEUE_MARKERS + SUBMIT_PENDING_MARKERS)
+    if pending:
+        return PageSnapshot(PageState.QUEUE, pending)
     # 订单确认页必须有提交按钮——详情页也会出现“观演人”文案，不能单靠它判定
     if device.find(SUBMIT_TEXTS):
         return PageSnapshot(PageState.ORDER_CONFIRM, "提交按钮")
@@ -78,9 +93,6 @@ def recognize(device: Device, task: TaskConfig) -> PageSnapshot:
     # 必须先于选票页判定（“预约想看票档”包含“票档”但不是购票）
     if device.find_contains("预约想看") is not None:
         return PageSnapshot(PageState.RESERVE, "预约想想看标记")
-    if (device.find(["提交缺货登记"])
-            or device.exists_contains_any(["暂时无票，若到货", "若始终缺货，将不再另外通知"])):
-        return PageSnapshot(PageState.STOCK_REGISTRATION, "缺货登记页")
     if device.find(TIER_SHEET_MARKERS) or device.find_by_id("tv_price_name"):
         return PageSnapshot(PageState.TIER_SHEET, "票档标签")
     # 详情页：仅认详情页/聚合页独有控件 id（文字判定已被搜索结果页

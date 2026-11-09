@@ -4,6 +4,7 @@
 """
 
 import logging
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -191,7 +192,6 @@ def create_app(db_path: Path) -> FastAPI:
 
     @app.patch("/api/tasks/{task_id}")
     def patch_task(task_id: int, body: TaskIn) -> Dict[str, Any]:
-        _validate_task(body)
         fields = {
             "name": body.name.strip(), "show_name": body.show_name.strip(),
             "on_sale_at": body.on_sale_at.strip(),
@@ -203,10 +203,11 @@ def create_app(db_path: Path) -> FastAPI:
             with manager.edit_task(task_id) as existing:
                 if not existing:
                     raise HTTPException(404, "任务不存在")
+                _validate_task(body, existing)
                 if any(fields[k] != existing[k] for k in
-                       ("show_name", "city", "session", "device_id")):
-                    fields.update(status="draft", calibrated_at="", scheduled_dry_run=0)
-                elif any(fields[k] != existing[k] for k in ("on_sale_at", "options", "price_tiers")):
+                       ("show_name", "city", "session", "device_id", "price_tiers")):
+                    fields.update(status="draft", calibrated_at="", scheduled_dry_run=0, calibration={})
+                elif any(fields[k] != existing[k] for k in ("on_sale_at", "options")):
                     fields.update(status="ready" if existing["calibrated_at"] else "draft",
                                   scheduled_dry_run=0)
                 if body.enabled is not None:
@@ -232,6 +233,12 @@ def create_app(db_path: Path) -> FastAPI:
                     raise ValueError("请先启用任务并绑定可用设备")
                 if not body.dry_run and not task["calibrated_at"]:
                     raise ValueError("请先校准页面开售时间，再确认正式排程")
+                if not body.dry_run and not task["session"]:
+                    raise ValueError("请先填写目标演出日期")
+                if not body.dry_run and len(task["price_tiers"]) != 1:
+                    raise ValueError("请校准读取预约页，或手动确认唯一预约票档")
+                if not body.dry_run and task["calibration"].get("mismatch"):
+                    raise ValueError("演出日期或票档与详情页不符，请核对任务资料后重新校准")
                 if body.dry_run and task["status"] in SCHEDULED_STATUSES and not task["scheduled_dry_run"]:
                     raise ValueError("该任务已有正式排程，请另建草稿进行定时演练")
                 fields = {"on_sale_at": body.on_sale_at.strip(), "status": "scheduled",
@@ -380,10 +387,24 @@ def rowdict_run(run_id: int) -> Optional[Dict[str, Any]]:
     return db.rowdict(row)
 
 
-def _validate_task(body: "TaskIn") -> None:
+def _validate_task(body: "TaskIn", existing=None) -> None:
     if not (body.name.strip() and body.show_name.strip() and body.price_tiers):
         raise HTTPException(400, "名称、演出关键词、票档优先级都不能为空")
     try:
+        session = body.session.strip()
+        if not existing or session != existing["session"]:
+            day, _, clock = session.partition(" ")
+            try:
+                if (date.fromisoformat(day).isoformat() != day
+                        or (clock and parse_local(session).strftime("%H:%M") != clock)):
+                    raise ValueError()
+            except ValueError as exc:
+                raise ValueError("请填写目标演出日期，格式为 YYYY-MM-DD，可加 HH:MM") from exc
+        if not existing or body.price_tiers != existing["price_tiers"]:
+            if len(body.price_tiers) != 1:
+                raise ValueError("只填写一个预约票档")
+            if any(not p.isascii() or not p.isdecimal() or int(p) <= 0 for p in body.price_tiers):
+                raise ValueError("票档价格请填写大于零的整数金额")
         task = TaskConfig(name=body.name, show_name=body.show_name,
                           on_sale_at=body.on_sale_at.strip() or "2000-01-01 00:00",
                           price_tiers=body.price_tiers, city=body.city, session=body.session,

@@ -202,21 +202,47 @@ def test_captcha_stops():
     print("✓ 验证码路径: 立即停止且不点击")
 
 
-def test_sold_out_tier_retries():
+def test_sold_out_tier_stops():
     task = build_task()
     scenes = [
         # 选票页：目标票档标缺货
         make_scene(
-            {"¥688": ((80, 900, 300, 960), True, True, "缺货登记 ¥688")},
-            extra_texts=["票档", "确定"],
+            {"¥688": ((80, 900, 300, 960), True, True, "¥688"),
+             "缺货登记": ((320, 900, 390, 960), False, True, "缺货登记"),
+             "票档": ((80, 850, 200, 890), False, True, "票档")},
         ),
     ]
     world, outcome = run_grabber(scenes, task)
-    # 不点缺货票档，直接 back 退出
-    assert world.taps == [], world.taps
-    assert world.backs >= 1
-    assert outcome in (None, "no-outcome")
-    print("✓ 缺货票档: 不点击，退出重试")
+    assert world.taps == [] and world.backs == 0
+    assert outcome == GrabOutcome.SOLD_OUT
+    print("✓ 预约票档缺货时停止")
+
+
+def test_order_retry_and_payment():
+    task = build_task()
+    submit = {"立即提交": ((600, 2200, 1000, 2280), True, True, "立即提交")}
+    retry = {
+        "继续尝试": ((400, 1300, 850, 1380), True, True, "继续尝试"),
+        "返回重新选购": ((500, 1450, 850, 1500), True, True, "返回重新选购"),
+    }
+    world, outcome = run_grabber([
+        make_scene(submit), make_scene({**submit, **retry}), make_scene(submit),
+        make_scene({"立即支付": ((600, 2200, 1000, 2280), True, True, "立即支付")}),
+    ], task)
+    assert outcome == GrabOutcome.SUCCESS
+    assert world.taps == [(800, 2240), (625, 1340), (800, 2240)]
+    assert world.backs == 0
+    print("✓ 提交 → 继续尝试 → 再提交 → 待支付即停")
+
+
+def test_pending_submit_does_not_double_tap():
+    task = build_task()
+    task.post_submit_watch_seconds = 1
+    submit = {"立即提交": ((600, 2200, 1000, 2280), True, True, "立即提交")}
+    world, outcome = run_grabber([make_scene(submit), make_scene(submit)], task)
+    assert outcome == GrabOutcome.NEEDS_HUMAN
+    assert world.taps == [(800, 2240)] and world.backs == 0
+    print("✓ 提交结果未明确时只点击一次")
 
 
 def test_button_inactive_waits():
@@ -233,6 +259,8 @@ def test_button_inactive_waits():
 if __name__ == "__main__":
     test_happy_path()
     test_captcha_stops()
-    test_sold_out_tier_retries()
+    test_sold_out_tier_stops()
+    test_order_retry_and_payment()
+    test_pending_submit_does_not_double_tap()
     test_button_inactive_waits()
     print("\n全部冒烟测试通过")

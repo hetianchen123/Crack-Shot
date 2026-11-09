@@ -105,6 +105,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     for column, declaration in (
         ("calibrated_at", "TEXT DEFAULT ''"),
         ("scheduled_dry_run", "INTEGER DEFAULT 0"),
+        ("calibration", "TEXT DEFAULT '{}'"),
     ):
         if column not in cols:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {declaration}")
@@ -235,12 +236,12 @@ def create_task(name: str, show_name: str, on_sale_at: str, price_tiers: List[st
 def update_task(task_id: int, fields: Dict[str, Any]) -> None:
     allowed = {"name", "show_name", "on_sale_at", "price_tiers", "options", "device_id",
                "enabled", "note", "share_url", "city", "session", "status",
-               "calibrated_at", "scheduled_dry_run"}
+               "calibrated_at", "scheduled_dry_run", "calibration"}
     sets, params = [], []
     for key, value in fields.items():
         if key not in allowed:
             continue
-        if key in ("price_tiers", "options"):
+        if key in ("price_tiers", "options", "calibration"):
             value = json.dumps(value, ensure_ascii=False)
         sets.append(f"{key}=?")
         params.append(value)
@@ -274,6 +275,7 @@ def list_tasks() -> List[Dict[str, Any]]:
         t = dict(r)
         t["price_tiers"] = json.loads(t["price_tiers"])
         t["options"] = json.loads(t["options"] or "{}")
+        t["calibration"] = json.loads(t["calibration"] or "{}")
         t["enabled"] = bool(t["enabled"])
         tasks.append(t)
     return tasks
@@ -286,6 +288,7 @@ def get_task(task_id: int) -> Optional[Dict[str, Any]]:
     t = dict(row)
     t["price_tiers"] = json.loads(t["price_tiers"])
     t["options"] = json.loads(t["options"] or "{}")
+    t["calibration"] = json.loads(t["calibration"] or "{}")
     t["enabled"] = bool(t["enabled"])
     return t
 

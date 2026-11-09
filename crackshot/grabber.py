@@ -17,8 +17,8 @@ from .adb import Adb, AdbError
 from .config import TaskConfig
 from .device import Device
 from .notify import Notifier
-from .pages import (SUBMIT_TEXTS, PageSnapshot, PageState,
-                    detail_button_state, recognize)
+from .pages import ORDER_RETRY_TEXTS, SOLD_OUT_TEXTS, SUBMIT_TEXTS, PageState, recognize
+from .show_details import session_matches
 from .timeutil import format_remaining, jitter_ms, now_ms, sleep_jitter
 from . import vision
 
@@ -27,6 +27,7 @@ log = logging.getLogger("crackshot.grabber")
 _BUY_PROBE_LEAD_MS = 750
 _BUY_TRANSITION_MS = 2000
 _UNKNOWN_TRANSITION_EXTRA_MS = 2000
+_CONTINUE_COOLDOWN_MS = 650
 
 
 def _rand(span: int) -> int:
@@ -38,6 +39,7 @@ def _rand(span: int) -> int:
 class GrabOutcome:
     SUCCESS = "success"
     NEEDS_HUMAN = "needs_human"   # 验证码/页面不符等，已停下
+    SOLD_OUT = "sold_out"
     TIMEOUT = "timeout"
     OFF_PAGE = "off_page"         # 长时间不在预期页面
     CANCELLED = "cancelled"       # 外部要求停止（web 后台取消等）
@@ -75,6 +77,10 @@ class Grabber:
         self._entered = True
         self._buy_transition_until_ms = 0
         self._unknown_after_buy = False
+        self._submit_until_ms = 0
+        self._queue_until_ms = 0
+        self._last_continue_ms = None
+        self._await_continue_page = False
         self._verify_detail = False
         self._waiting_for_button = False
         self._needs_backoff = True  # 仅等待按钮翻转时为 False，避免轮询被退避拖慢
@@ -118,23 +124,25 @@ class Grabber:
         self._sale_at_ms = on_sale_ms
         self._verify_detail = verify_detail
         self._entered = False
-        log.info("进入抢票循环，窗口 %s 秒，票档优先级 %s",
-                 self.task.max_retry_seconds, self.task.price_tiers)
+        if not self.dry_run and len(self.task.price_tiers) != 1:
+            self.notify.critical("请先确认唯一预约票档，任务已停止")
+            return GrabOutcome.NEEDS_HUMAN
+        log.info("进入抢票循环，窗口 %s 秒，目标票档 %s",
+                 self.task.max_retry_seconds, self.task.price_tiers[:1])
 
         probe_at_ms = on_sale_ms - _BUY_PROBE_LEAD_MS
-        while now_ms() < self.deadline_ms:
+        while now_ms() < max(self.deadline_ms, self._submit_until_ms, self._queue_until_ms):
             if self._stop_requested():
                 log.info("收到取消请求，停止抢票")
                 return GrabOutcome.CANCELLED
-            if self.attempts >= self.task.max_attempts:
+            if self.attempts >= self.task.max_attempts and not (self._submit_until_ms or self._queue_until_ms):
                 log.info("达到尝试次数上限 %s，停止", self.task.max_attempts)
                 return GrabOutcome.TIMEOUT
             until_probe_ms = probe_at_ms - now_ms()
             if until_probe_ms > 0:
                 time.sleep(min(0.2, until_probe_ms / 1000))
                 continue
-            if not self._entered or self._waiting_for_button or self._buy_transition_until_ms:
-                self.device.refresh(fast=True)
+            self.device.refresh(fast=True)
             self._waiting_for_button = False
             try:
                 outcome = self._attempt()
@@ -168,8 +176,7 @@ class Grabber:
             return self._wait_for_button()
 
         if snap.state == PageState.STOCK_REGISTRATION:
-            self.notify.critical("当前为缺货登记页，请人工核对票况")
-            return GrabOutcome.NEEDS_HUMAN
+            return self._sold_out("当前为缺货登记页")
 
         if not self._entered:
             if snap.state == PageState.UNKNOWN and now_ms() < self._sale_at_ms + _BUY_TRANSITION_MS:
@@ -213,6 +220,27 @@ class Grabber:
             self.notify.info("演练已停止：页面已离开详情页")
             return GrabOutcome.OFF_PAGE
 
+        if snap.state == PageState.ORDER_RETRY:
+            return self._continue_order()
+        if self._await_continue_page and snap.state == PageState.UNKNOWN:
+            return self._wait_for_order(self._last_continue_ms + _BUY_TRANSITION_MS)
+        self._await_continue_page = False
+        if snap.state == PageState.QUEUE:
+            if not self._queue_until_ms:
+                self._queue_until_ms = now_ms() + self.task.queue_wait_seconds * 1000
+                log.info("订单已进入排队或提交处理中")
+            return self._wait_for_order(self._queue_until_ms)
+        if snap.state == PageState.ERROR_DIALOG and any(
+                word in snap.matched for word in SOLD_OUT_TEXTS + ["库存不足", "余票不足"]):
+            return self._sold_out(snap.matched)
+        if snap.state == PageState.DETAIL and self._detail_sold_out():
+            return self._sold_out("详情页显示缺货")
+        pending = self._queue_until_ms or self._submit_until_ms
+        if pending:
+            if snap.state != PageState.ERROR_DIALOG:
+                return self._wait_for_order(pending)
+            self._queue_until_ms = self._submit_until_ms = 0
+
         if snap.state == PageState.DETAIL:
             if self._verify_detail:
                 from .navigator import is_target_detail
@@ -225,8 +253,6 @@ class Grabber:
             return self._from_tier_sheet()
         if snap.state == PageState.ORDER_CONFIRM:
             return self._from_order_confirm()
-        if snap.state == PageState.QUEUE:
-            return self._wait_queue()
 
         # UNKNOWN：可能是票务须知弹窗挡住（首进城市站必弹），先尝试关闭
         from .navigator import dismiss_ticket_notice
@@ -238,6 +264,22 @@ class Grabber:
         return None
 
     # ---- 各页面处理 ----------------------------------------------------
+
+    def _sold_out(self, reason: str) -> str:
+        log.info("停止抢票：%s", reason)
+        self._evidence("sold_out")
+        return GrabOutcome.SOLD_OUT
+
+    def _detail_sold_out(self) -> bool:
+        if now_ms() < self._sale_at_ms or self._sale_countdown_present():
+            return False
+        button = self.device.find(SOLD_OUT_TEXTS)
+        bar = self.device.find_by_id("purchase_status_bar")
+        if not button or not bar:
+            return False
+        x, y = button.center
+        left, top, right, bottom = bar.bounds
+        return left <= x <= right and top <= y <= bottom
 
     def _wait_for_button(self) -> None:
         self._needs_backoff = False
@@ -320,52 +362,66 @@ class Grabber:
             log.warning("选票页视觉解析失败: %s", exc)
             sleep_jitter(self.task.retry_backoff_ms)
             return None
-        layout = tiers.reconcile_with_tags(layout, self.device)
-
-        # 场次：配置了 session 且当前选中场次不匹配 → 点匹配项
+        # 只使用目标日期的票档。切换场次后，旧截图中的票档坐标和库存都可能变化。
         if self.task.session:
-            target = None
-            selected = next((s for s in layout["sessions"] if s.get("selected")), None)
-            if selected is None or self.task.session not in str(selected.get("text", "")):
-                for s in layout["sessions"]:
-                    if self.task.session in str(s.get("text", "")):
-                        target = s
-                        break
-            if target and not self.dry_run:
+            matches = [s for s in layout["sessions"]
+                       if session_matches(self.task.session, str(s.get("text", "")))]
+            if not any(s.get("selected") for s in matches):
+                if len(matches) != 1:
+                    self.notify.critical(f"未能唯一确认目标演出日期 {self.task.session}，请人工核对")
+                    return GrabOutcome.NEEDS_HUMAN
+                target = matches[0]
                 x = target["x"] + _rand(30)
                 y = target["y"] + _rand(12)
                 log.info("选择场次 %s → (%s,%s)", target.get("text"), x, y)
                 self._tap(x, y)
                 sleep_jitter(self.task.confirm_wait_ms)
+                self._needs_backoff = False
+                return None
 
-        pick = tiers.pick_tier(layout["tiers"], self.task.price_tiers)
+        layout = tiers.reconcile_with_tags(layout, self.device)
+        target_price = self.task.price_tiers[0]
+        pick = tiers.pick_tier(layout["tiers"], [target_price])
         if not pick:
-            log.info("所有优先票档均缺货（%s），退出重试",
-                     [t["price"] for t in layout["tiers"] if not t["in_stock"]])
-            self._evidence("tier_no_stock")
-            if not self.dry_run:
-                self._back()
-            sleep_jitter(self.task.retry_backoff_ms)
-            return None
+            visible = [{**tier, "in_stock": True} for tier in layout["tiers"]]
+            if tiers.pick_tier(visible, [target_price]):
+                return self._sold_out(f"预约票档 ¥{target_price} 缺货")
+            self.notify.critical(f"选票页未能识别预约票档 ¥{target_price}，请人工核对")
+            return GrabOutcome.NEEDS_HUMAN
 
-        log.info("选中票档 %s（优先级 %s）", pick["price"], self.task.price_tiers)
+        log.info("选中预约票档 %s", pick["price"])
 
-        # 随机点击票档（±30/±12 抖动；选档与确定均无下单副作用，dry-run 也执行）
+        # 在匹配的票档内点击，再确认。
         x = pick["x"] + _rand(30)
         y = pick["y"] + _rand(12)
         self._tap(x, y)
         sleep_jitter(self.task.confirm_wait_ms)
         # 像素检测橙色「确定」按钮（未选好票档时按钮不亮）
         for _ in range(3):
+            if self._stop_requested():
+                return GrabOutcome.CANCELLED
+            if now_ms() >= self.deadline_ms:
+                return GrabOutcome.TIMEOUT
+            state = recognize(self.device, self.task).state
+            if state != PageState.TIER_SHEET:
+                self._needs_backoff = False
+                return None
+            confirm = self.device.find(["确定"])
+            if confirm and confirm.enabled:
+                self._tap(*confirm.center)
+                self._buy_transition_until_ms = now_ms() + _BUY_TRANSITION_MS
+                self._needs_backoff = False
+                return None
             try:
-                png = self.adb.screencap_bytes()
-                hit = tiers.tap_confirm(self.adb, png)
+                hit = tiers.tap_confirm(self.adb, self.adb.screencap_bytes()) if confirm is None else None
             except Exception as exc:  # noqa: BLE001
                 log.debug("确定按钮检测异常: %s", exc)
                 hit = None
             if hit:
                 log.info("点击确定按钮 @%s", hit)
-                sleep_jitter(self.task.confirm_wait_ms)
+                self.device.refresh()
+                self._buy_transition_until_ms = now_ms() + _BUY_TRANSITION_MS
+                self._needs_backoff = False
                 return None  # 下一轮识别订单页
             sleep_jitter((150, 350))
         log.info("确定按钮未亮（票档可能未选中），重试本页")
@@ -392,71 +448,54 @@ class Grabber:
             return GrabOutcome.NEEDS_HUMAN
 
         submit = self.device.find(SUBMIT_TEXTS)
-        if not submit:
-            log.info("确认订单页未找到提交按钮，退出重试")
-            self._dismiss_error_and_back()
-            return None
+        if not submit or not submit.enabled:
+            return self._wait_for_order(self.deadline_ms)
         if self.device.exists_any(["请选择观演人", "添加观演人"]):
-            self.notify.critical(f"[{self.task.name}] 订单页观演人未预填，请人工处理（脚本已停止）")
+            self.notify.critical(f"[{self.task.name}] 订单页观演人未预填，请人工处理")
             return GrabOutcome.NEEDS_HUMAN
         if self.dry_run:
-            log.info("[dry-run] 检测到提交按钮「%s」，不点击", submit.text)
-            self.notify.success(f"[{self.task.name}] 演练通过：到达提交步骤（观演人已选中），"
-                                "正式运行将自动提交")
-            return GrabOutcome.SUCCESS
+            return "guard_verified"
 
-        x, y = submit.center
-        log.info("点击「%s」(%s,%s)", submit.text, x, y)
-        self._tap(x + _rand(40), y + _rand(10))
-        # 提交后观察结果
-        watch_until = now_ms() + self.task.post_submit_watch_seconds * 1000
-        while now_ms() < watch_until:
-            if self._stop_requested():
-                return GrabOutcome.CANCELLED
-            sleep_jitter(self.task.poll_interval_ms)
-            snap = recognize(self.device, self.task)
-            if snap.state == PageState.SUCCESS:
-                self.notify.success(f"[{self.task.name}] 下单成功，请尽快人工支付")
-                self._evidence("success")
-                return GrabOutcome.SUCCESS
-            if snap.state == PageState.CAPTCHA:
-                self._evidence("captcha")
-                self.notify.critical("提交后触发验证码，请人工处理（脚本已停止）")
-                return GrabOutcome.NEEDS_HUMAN
-            if snap.state == PageState.QUEUE:
-                return self._wait_queue()
-            if snap.state == PageState.ERROR_DIALOG:
-                log.info("提交失败（%s），关闭后重试", snap.matched)
-                self._dismiss_error_and_back()
-                return None
-        log.info("提交后 %s 秒内未出现明确结果，继续观察/重试", self.task.post_submit_watch_seconds)
+        if self._last_continue_ms is not None and now_ms() - self._last_continue_ms < 180:
+            return self._wait_for_order(self.deadline_ms)
+        if self._stop_requested():
+            return GrabOutcome.CANCELLED
+        if now_ms() >= self.deadline_ms:
+            return GrabOutcome.TIMEOUT
+
+        # 点击返回结果不明时仍视为已提交，直到页面明确给出重试结果。
+        self._submit_until_ms = now_ms() + self.task.post_submit_watch_seconds * 1000
+        self._tap(*submit.center)
+        log.info("点击提交订单 (%s,%s)，等待明确结果", *submit.center)
+        self._needs_backoff = False
         return None
 
-    def _wait_queue(self) -> Optional[str]:
-        log.info("排队中，最长等待 %s 秒（不重复提交）", self.task.queue_wait_seconds)
-        self.notify.info(f"[{self.task.name}] 排队中，等待结果…")
-        queue_until = now_ms() + self.task.queue_wait_seconds * 1000
-        while now_ms() < queue_until:
-            if self._stop_requested():
-                return GrabOutcome.CANCELLED
-            sleep_jitter((500, 1200))
-            snap = recognize(self.device, self.task)
-            if snap.state == PageState.SUCCESS:
-                self.notify.success(f"[{self.task.name}] 排队结束下单成功，请人工支付")
-                self._evidence("success")
-                return GrabOutcome.SUCCESS
-            if snap.state == PageState.CAPTCHA:
-                self._evidence("captcha")
-                self.notify.critical("排队后触发验证码，请人工处理（脚本已停止）")
-                return GrabOutcome.NEEDS_HUMAN
-            if snap.state not in (PageState.QUEUE, PageState.ORDER_CONFIRM):
-                log.info("排队结束，页面状态 %s（%s）", snap.state.value, snap.matched)
-                if snap.state == PageState.ERROR_DIALOG:
-                    self._dismiss_error_and_back()
-                return None
-        log.info("排队超时，人工查看手机")
-        self.notify.critical(f"[{self.task.name}] 排队等待超过 {self.task.queue_wait_seconds} 秒，请人工查看")
-        return GrabOutcome.NEEDS_HUMAN
+    def _continue_order(self) -> Optional[str]:
+        if self._last_continue_ms is not None and now_ms() - self._last_continue_ms < _CONTINUE_COOLDOWN_MS:
+            return self._wait_for_order(self.deadline_ms)
+        button = self.device.find(ORDER_RETRY_TEXTS)
+        if not button or not button.enabled:
+            return self._wait_for_order(self.deadline_ms)
+        if self._stop_requested():
+            return GrabOutcome.CANCELLED
+        if now_ms() >= self.deadline_ms or self.attempts >= self.task.max_attempts:
+            return GrabOutcome.TIMEOUT
+        self._last_continue_ms = now_ms()
+        self._tap(*button.center)
+        self._await_continue_page = True
+        self._submit_until_ms = self._queue_until_ms = 0
+        self._needs_backoff = False
+        log.info("已点继续尝试，立即核对下一页")
+        return None
+
+    def _wait_for_order(self, until_ms: int) -> Optional[str]:
+        if now_ms() >= until_ms:
+            self.notify.critical("订单状态仍未明确，请在手机上核对")
+            return GrabOutcome.NEEDS_HUMAN
+        self._waiting_for_button = True
+        self._needs_backoff = False
+        time.sleep(0.055)
+        return None
 
     # ---- 工具 ----------------------------------------------------------
 
