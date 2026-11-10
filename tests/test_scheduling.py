@@ -338,6 +338,67 @@ class SchedulingTests(unittest.TestCase):
                                      for i in range(7)])
         self.assertIn("已提交 4 次", messages[0])
 
+    def test_order_refresh_is_clicked_once_while_full_page_notice_stays_open(self):
+        self.now = SALE_MS
+        task = TaskConfig("test", SHOW, SALE, ["688"])
+        enabled = False
+        dev = device_with_xml(lambda: node("确认购买")
+                              + node("抢票人数太多啦，继续尝试别放弃")
+                              + node("努力刷新", bounds="[350,1650][730,1800]", enabled=enabled)
+                              + node("立即提交", bounds="[700,2100][1000,2240]"))
+        instance = grabber.Grabber(self.adb(), dev, task, SimpleNamespace(critical=lambda _: None),
+                                   Path(self.tmp.name))
+        instance.deadline_ms = SALE_MS + 10000
+
+        self.assertIsNone(instance._attempt())
+        self.assertEqual(self.taps, [])
+        enabled = True
+        dev.refresh()
+        refresh_at = self.now
+        self.assertIsNone(instance._attempt())
+        self.now = refresh_at + 800
+        self.assertIsNone(instance._attempt())
+        self.now = refresh_at + 2000
+        self.assertEqual(instance._attempt(), grabber.GrabOutcome.NEEDS_HUMAN)
+        self.assertEqual(self.taps, [(refresh_at, (540, 1725))])
+
+    def test_order_failure_notices_stop_without_dismissing(self):
+        self.now = SALE_MS
+        task = TaskConfig("test", SHOW, SALE, ["688"])
+        cases = [
+            ("当前访问页面失效，可能您停留时间过长，请重新提交申请", "",
+             PageState.ORDER_REVIEW, grabber.GrabOutcome.NEEDS_HUMAN),
+            ("商品已经过期", "", PageState.ORDER_REVIEW, grabber.GrabOutcome.NEEDS_HUMAN),
+            ("网络开小差了，再试一次吧～", "继续尝试",
+             PageState.ORDER_REVIEW, grabber.GrabOutcome.NEEDS_HUMAN),
+            ("亲，同一时间下单人数过多，建议您稍后再试", "",
+             PageState.ORDER_REVIEW, grabber.GrabOutcome.NEEDS_HUMAN),
+            ("对不起，您选购的商品库存不足，请重新选购", "",
+             PageState.ORDER_SOLD_OUT, grabber.GrabOutcome.SOLD_OUT),
+            ("请完成滑块验证", "继续尝试",
+             PageState.CAPTCHA, grabber.GrabOutcome.NEEDS_HUMAN),
+        ]
+        for message, action, state, outcome in cases:
+            with self.subTest(message=message):
+                dev = device_with_xml(lambda: node(message) + node(action)
+                                      + node("返回重新选购") + node("立即提交"))
+                instance = grabber.Grabber(self.adb(), dev, task,
+                                           SimpleNamespace(critical=lambda _: None),
+                                           Path(self.tmp.name))
+                instance.deadline_ms = SALE_MS + 10000
+                self.assertEqual(recognize(dev, task).state, state)
+                self.assertEqual(instance._attempt(), outcome)
+                self.assertEqual(self.taps, [])
+
+    def test_queue_congestion_popup_differs_from_active_queue(self):
+        task = TaskConfig("test", SHOW, SALE, ["688"])
+        message = "当前排队人数较多"
+        modal = device_with_xml(lambda: node(message + "，实在挤不进去了")
+                                + node("继续尝试") + node("返回重新选购"))
+        queue = device_with_xml(lambda: node("确认购买") + node("正在排队，" + message))
+        self.assertEqual(recognize(modal, task).state, PageState.ORDER_RETRY)
+        self.assertEqual(recognize(queue, task).state, PageState.QUEUE)
+
     def test_timed_rehearsal_does_not_click_or_requeue(self):
         tid = self.create_draft()
         self.request("POST", f"/api/tasks/{tid}/schedule", {"on_sale_at": SALE, "dry_run": True})

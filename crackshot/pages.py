@@ -20,7 +20,9 @@ class PageState(Enum):
     STOCK_REGISTRATION = "stock_registration"  # 缺货登记页，与正常选票页共用票档布局
     TIER_SHEET = "tier_sheet"        # 选票浮层（场次/票档/确定）
     ORDER_CONFIRM = "order_confirm"  # 确认订单页（观演人/提交订单）
-    ORDER_RETRY = "order_retry"      # 提交拥挤弹窗，明确允许继续尝试
+    ORDER_RETRY = "order_retry"      # 订单拥挤页或弹窗，允许原地重试
+    ORDER_REVIEW = "order_review"    # 页面失效、网络提示或下单冲突，停留交人工
+    ORDER_SOLD_OUT = "order_sold_out"  # 订单弹窗提示所选商品库存不足
     TICKET_NOTICE = "ticket_notice"
     QUEUE = "queue"                  # 排队中
     SUCCESS = "success"              # 下单成功/待支付
@@ -43,7 +45,9 @@ class PageSnapshot:
 TIER_SHEET_MARKERS = ["票档", "每笔订单限购", "先到先得"]
 # 订单确认页提交按钮：实测文案为'立即提交'（旧版本为'提交订单'）
 SUBMIT_TEXTS = ["立即提交", "提交订单"]
-ORDER_RETRY_TEXTS = ["继续尝试"]
+ORDER_STOCK_MARKERS = ["库存不足", "余票不足"]
+_ORDER_REVIEW_MARKERS = ["当前访问页面失效", "商品已经过期", "商品已过期",
+                         "网络开小差", "同一时间下单人数过多"]
 SOLD_OUT_TEXTS = ["缺货登记", "已售罄", "暂无余票", "暂时无票"]
 QUEUE_MARKERS = ["排队中", "正在排队", "前方排队"]
 SUBMIT_PENDING_MARKERS = ["正在提交订单", "订单提交中", "正在提交", "请勿重复提交"]
@@ -78,9 +82,10 @@ def recognize(device: Device, task: TaskConfig) -> PageSnapshot:
     if (device.find(["提交缺货登记"])
             or device.exists_contains_any(["暂时无票，若到货", "若始终缺货，将不再另外通知"])):
         return PageSnapshot(PageState.STOCK_REGISTRATION, "缺货登记页")
-    retry = device.find(ORDER_RETRY_TEXTS)
-    if retry and (device.find(["返回重新选购"]) or device.find(SUBMIT_TEXTS)):
-        return PageSnapshot(PageState.ORDER_RETRY, "继续尝试")
+    submit = device.find(SUBMIT_TEXTS)
+    order_notice = _recognize_order_notice(device, submit is not None)
+    if order_notice:
+        return order_notice
     # 失败提示多为长文案（contains），但必须同时存在弹窗按钮才按弹窗处理，
     # 否则“已售罄”这类详情页按钮文字会被误判成失败弹窗
     err_hit = _hit_contains(device, task.error_texts)
@@ -90,7 +95,7 @@ def recognize(device: Device, task: TaskConfig) -> PageSnapshot:
     if pending:
         return PageSnapshot(PageState.QUEUE, pending)
     # 订单确认页必须有提交按钮——详情页也会出现“观演人”文案，不能单靠它判定
-    if device.find(SUBMIT_TEXTS):
+    if submit:
         return PageSnapshot(PageState.ORDER_CONFIRM, "提交按钮")
     # 预约登记页（未开票）：同样是 tv_price_name 布局但语义完全不同，
     # 必须先于选票页判定（“预约想看票档”包含“票档”但不是购票）
@@ -104,6 +109,31 @@ def recognize(device: Device, task: TaskConfig) -> PageSnapshot:
     if hint:
         return PageSnapshot(PageState.DETAIL, f"详情页特征:{hint}")
     return PageSnapshot(PageState.UNKNOWN, "")
+
+
+def _recognize_order_notice(device: Device, has_submit: bool) -> Optional[PageSnapshot]:
+    reselect = device.find(["返回重新选购"])
+    order_title = device.find(["确认购买"])
+    refresh = device.find(["努力刷新"])
+    order_context = reselect or order_title or has_submit
+    if not (order_context or refresh):
+        return None
+
+    review = _hit_contains(device, _ORDER_REVIEW_MARKERS)
+    if review:
+        return PageSnapshot(PageState.ORDER_REVIEW, review)
+    if reselect:
+        stock = _hit_contains(device, ORDER_STOCK_MARKERS)
+        if stock:
+            return PageSnapshot(PageState.ORDER_SOLD_OUT, stock)
+
+    if order_context and device.find(["继续尝试"]):
+        return PageSnapshot(PageState.ORDER_RETRY, "继续尝试")
+    if device.exists_contains_any(["抢票人数太多"]):
+        return PageSnapshot(PageState.ORDER_RETRY, "努力刷新" if refresh or order_title else "继续尝试")
+    if reselect and device.exists_contains_any(["排队人数较多"]):
+        return PageSnapshot(PageState.ORDER_RETRY, "继续尝试")
+    return None
 
 
 def ticket_notice_button(device):

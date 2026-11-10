@@ -22,7 +22,7 @@ from .config import TaskConfig
 from .device import Device
 from .notify import Notifier
 from .opening import OpeningProbe
-from .pages import ORDER_RETRY_TEXTS, SOLD_OUT_TEXTS, SUBMIT_TEXTS, PageState, recognize
+from .pages import ORDER_STOCK_MARKERS, SOLD_OUT_TEXTS, SUBMIT_TEXTS, PageState, recognize
 from .tiers import read_confirm
 from .timeutil import now_ms, sleep_jitter
 from . import vision
@@ -195,6 +195,12 @@ class Grabber:
 
         if snap.state == PageState.STOCK_REGISTRATION:
             return self._sold_out("当前为缺货登记页")
+        if snap.state == PageState.ORDER_SOLD_OUT:
+            return self._sold_out(snap.matched)
+        if snap.state == PageState.ORDER_REVIEW:
+            self._evidence("order_review")
+            self.notify.critical(f"确认购买页提示「{snap.matched}」，已停止，请在手机上核对")
+            return GrabOutcome.NEEDS_HUMAN
 
         if not self._entered:
             if snap.state == PageState.UNKNOWN and now_ms() < self._sale_at_ms + _BUY_TRANSITION_MS:
@@ -242,14 +248,14 @@ class Grabber:
             return self._wait_for_order(self._last_order_action_ms + _BUY_TRANSITION_MS)
         self._await_continue_page = False
         if snap.state == PageState.ORDER_RETRY:
-            return self._continue_order()
+            return self._continue_order(snap.matched)
         if snap.state == PageState.QUEUE:
             if not self._queue_until_ms:
                 self._queue_until_ms = now_ms() + self.task.queue_wait_seconds * 1000
                 log.info("订单已进入排队或提交处理中")
             return self._wait_for_order(self._queue_until_ms)
         if snap.state == PageState.ERROR_DIALOG and any(
-                word in snap.matched for word in SOLD_OUT_TEXTS + ["库存不足", "余票不足"]):
+                word in snap.matched for word in SOLD_OUT_TEXTS + ORDER_STOCK_MARKERS):
             return self._sold_out(snap.matched)
         if snap.state == PageState.DETAIL and self._detail_sold_out():
             return self._sold_out("详情页显示缺货")
@@ -478,12 +484,12 @@ class Grabber:
         self._needs_backoff = False
         return None
 
-    def _continue_order(self) -> Optional[str]:
+    def _continue_order(self, action_text: str) -> Optional[str]:
         if self._order_submissions >= _MAX_ORDER_SUBMISSIONS:
             return self._order_retry_exhausted()
         if now_ms() - self._last_order_action_ms < _ORDER_ACTION_INTERVAL_MS:
             return self._wait_for_order(self.deadline_ms)
-        button = self.device.find(ORDER_RETRY_TEXTS)
+        button = self.device.find([action_text])
         if not button or not button.enabled:
             return self._wait_for_order(self.deadline_ms)
         if self._stop_requested():
@@ -495,7 +501,7 @@ class Grabber:
         self._submit_until_ms = self._queue_until_ms = 0
         self._tap(*button.center)
         self._needs_backoff = False
-        log.info("已点继续尝试，等待页面就绪及订单操作冷却")
+        log.info("已点「%s」，等待页面就绪及订单操作冷却", action_text)
         return None
 
     def _order_retry_exhausted(self) -> str:
