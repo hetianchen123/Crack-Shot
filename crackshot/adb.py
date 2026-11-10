@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import struct
 import subprocess
 import time
 from pathlib import Path
@@ -100,6 +101,21 @@ class Adb:
         if not result.stdout.startswith(png_magic):
             raise AdbError("截图失败（可能被 FLAG_SECURE 页面拦截）")
         return result.stdout
+
+    def screencap_raw(self) -> tuple:
+        """获取未压缩的 RGBA 数据，避免手机编码 PNG。"""
+        try:
+            data = subprocess.check_output(
+                [self.adb_path, "-s", self.serial, "exec-out", "screencap"],
+                stderr=subprocess.PIPE, timeout=2.0)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise AdbError("原始截图读取失败") from exc
+        if len(data) >= 16:
+            width, height, pixel_format = struct.unpack_from("<III", data)
+            offset = len(data) - width * height * 4
+            if pixel_format in (1, 2) and width > 0 and height > 0 and offset in (12, 16):
+                return width, height, memoryview(data)[offset:]
+        raise AdbError("手机返回了不支持的原始截图格式")
 
     def foreground_package(self) -> Optional[str]:
         out = self.shell("dumpsys", "activity", "activities", timeout=8.0)

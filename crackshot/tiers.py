@@ -1,133 +1,204 @@
-"""选票页视觉解析：qwen3-vl 读取票档价格/库存/位置，返回可点击布局。
+"""本地选票页识别，支持定位确认按钮及读取票档。"""
 
-选票页的票档价格与“确定”按钮均为自绘控件（控件树无文字节点），
-只有“缺货登记”标签可读。开票前用本地视觉模型解析一次布局，
-热路径按解析坐标随机点击；确定按钮用 vision.find_buy_button 像素检测。
-"""
-
-from __future__ import annotations
-
-import base64
-import json
-import logging
+from dataclasses import dataclass
 import re
-from typing import Any, Dict, List, Optional
-from urllib.error import URLError
-from urllib.request import Request, urlopen
 
-from . import vision
-from .adb import Adb
+from .digitmatch import orange, read_digits
+from .show_details import session_matches
 
-log = logging.getLogger("crackshot.tiers")
-
-# 归一化坐标（0-1000）让模型输出稳定，再按截图实际尺寸换算
-PROMPT = """这是大麦App选票页面的截图。请仔细识别并返回严格 JSON：
-{
- "sessions": [{"text": "场次文字如 2026-11-28 周六 19:00", "selected": true/false, "cx": 0-1000, "cy": 0-1000}],
- "tiers": [{"price": "纯数字价格如 688", "in_stock": true/false, "cx": 0-1000, "cy": 0-1000}],
- "notes": "其他异常说明，没有则空字符串"
-}
-要求：
-- tiers 按页面从上到下、从左到右顺序列出所有票档；
-- in_stock：该票档行带“缺货登记”字样时为 false；
-- cx/cy 是该票档价格文字中心在截图中的相对位置（横向0=最左1000=最右，纵向0=最顶1000=最底）；
-- 只报告真实可见内容，不推测。"""
+_SESSION_LIST = "project_detail_perform_flowlayout"
+_PRICE_LIST = "project_detail_perform_price_flowlayout"
+_CARD = "ll_perform_item"
+_BOTTOM = "id_sku_bottom_bar_container"
+_DATE = re.compile(r"^([0-9]{4}-[0-9]{2}-[0-9]{2})")
+_CLOCK = re.compile(r"([0-9]{2}:[0-9]{2})$")
+_PRICE = re.compile(r"[¥￥]\s*([0-9,]+)|([0-9,]+)\s*元")
+_UNAVAILABLE = ("缺货登记", "已售罄", "暂无余票", "不可购买", "可预约")
 
 
-def parse_tier_sheet(png_bytes: bytes, ollama_url: str, model: str,
-                     timeout: float = 120.0) -> Dict[str, Any]:
-    """截图 → 选票页布局（sessions/tiers 带绝对像素坐标）。"""
-    from PIL import Image
-    import io
-    w, h = Image.open(io.BytesIO(png_bytes)).size
-
-    payload = {
-        "model": model,
-        "stream": False,
-        "format": {"type": "object", "properties": {
-            "sessions": {"type": "array", "items": {"type": "object", "properties": {
-                "text": {"type": "string"}, "selected": {"type": "boolean"},
-                "cx": {"type": "integer"}, "cy": {"type": "integer"}}}},
-            "tiers": {"type": "array", "items": {"type": "object", "properties": {
-                "price": {"type": "string"}, "in_stock": {"type": "boolean"},
-                "cx": {"type": "integer"}, "cy": {"type": "integer"}},
-                "required": ["price", "in_stock", "cx", "cy"]}},
-            "notes": {"type": "string"}},
-            "required": ["tiers"]},
-        "options": {"temperature": 0, "num_ctx": 4096, "num_predict": 900},
-        "messages": [{"role": "user", "content": PROMPT,
-                      "images": [base64.b64encode(png_bytes).decode("ascii")]}],
-    }
-    req = Request(f"{ollama_url.rstrip('/')}/api/chat",
-                  data=json.dumps(payload).encode("utf-8"),
-                  headers={"Content-Type": "application/json"})
-    with urlopen(req, timeout=timeout) as resp:
-        content = json.loads(resp.read().decode("utf-8"))["message"]["content"]
-    parsed = _load_json(content)
-    if not parsed or not parsed.get("tiers"):
-        raise RuntimeError(f"视觉解析选票页失败: {str(content)[:200]}")
-
-    def _abs(node: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            **node,
-            "x": int(node.get("cx", 500) / 1000 * w),
-            "y": int(node.get("cy", 500) / 1000 * h),
-        }
-
-    return {
-        "size": (w, h),
-        "sessions": [_abs(s) for s in parsed.get("sessions", [])],
-        "tiers": [_abs(t) for t in parsed["tiers"]],
-        "notes": parsed.get("notes", ""),
-    }
+@dataclass(frozen=True)
+class Selection:
+    action: str
+    point: tuple = ()
+    reason: str = ""
+    quantity: int = 0
 
 
-def reconcile_with_tags(layout: Dict[str, Any], device) -> Dict[str, Any]:
-    """用控件树「缺货登记」标签坐标交叉校正票档库存。
-
-    模型偶发把有票误判为缺货（实测 qwen3-vl:4b 有 1/7 错误率），而缺货
-    标签在控件树是真实可读节点——以控件树为准：票档 y 与任一缺货 tag y
-    对齐（±90px）即缺货，否则视为有票。
-    """
-    tags = device.find_all(["缺货登记"])
-    for tag in tags:
-        tx, ty = tag.center
-        candidates = [tier for tier in layout["tiers"] if 0 <= tx - tier["x"] < 350
-                      and abs(tier["y"] - ty) < 90]
-        if candidates:
-            nearest = min(candidates, key=lambda tier: (tx - tier["x"]) ** 2 + (ty - tier["y"]) ** 2)
-            nearest["in_stock"] = False
-    return layout
+def _id(node):
+    return node.resource_id.rsplit("/", 1)[-1]
 
 
-def pick_tier(tiers: List[Dict[str, Any]], wanted: List[str]) -> Optional[Dict[str, Any]]:
-    """按用户票档优先级选第一个有货的票档；都没有货返回 None。"""
-    for price in wanted:
-        digits = re.sub(r"\D", "", str(price))
-        if not digits:
-            continue
-        for tier in tiers:
-            if re.sub(r"\D", "", str(tier.get("price", ""))) == digits and tier.get("in_stock"):
-                return tier
-    return None
+def _label(node):
+    return (node.text or node.description).strip()
 
 
-def tap_confirm(adb: Adb, png_bytes: bytes) -> Optional[tuple]:
-    """像素检测橙色“确定”按钮并随机点击，返回点击坐标。"""
-    bbox = vision.find_buy_button(png_bytes)
-    if not bbox:
-        return None
-    return vision.tap_button_jitter(adb, bbox)
+def _under(node, parent):
+    while node.parent is not None:
+        node = node.parent
+        if node is parent:
+            return True
+    return False
 
 
-def _load_json(content: str) -> Optional[Dict[str, Any]]:
-    try:
-        return json.loads(content)
-    except ValueError:
-        match = re.search(r"\{.*\}", content, re.S)
-        if match:
-            try:
-                return json.loads(match.group(0))
-            except ValueError:
-                return None
-        return None
+def _crop(pixels, bounds):
+    left, top, right, bottom = bounds
+    if not (0 <= left < right <= pixels.shape[1] and 0 <= top < bottom <= pixels.shape[0]):
+        return pixels[0:0, 0:0]
+    return pixels[top:bottom, left:right, :3]
+
+
+class _Card:
+    def __init__(self, node, nodes):
+        self.node = node
+        self.children = [n for n in nodes if _under(n, node)]
+
+    def native_selected(self):
+        return any(n.selected or n.checked for n in (self.node, *self.children))
+
+    def selected_border(self, screen):
+        card = _crop(screen(), self.node.bounds)
+        height, width = card.shape[:2]
+        if height < 16 or width < 32:
+            return False
+        middle = card[:, width // 4:width * 3 // 4]
+        edge = max(2, height // 10)
+        return any(orange(band).any(axis=0).mean() >= .55
+                   for band in (middle[:edge], middle[-edge:]))
+
+    def unavailable(self):
+        return any(_label(n) in _UNAVAILABLE for n in self.children)
+
+    def _text_crop(self, screen):
+        left, top, right, bottom = self.node.bounds
+        height = bottom - top
+        badge_start = min((n.bounds[0] for n in self.children
+                           if _id(n) == "tv_tag" and n.bounds[0] > left), default=right)
+        return _crop(screen(), (left + height // 6, top + height // 5,
+                                min(right - height // 8, badge_start - 3),
+                                bottom - height // 5))
+
+    def session(self, screen):
+        for node in (self.node, *self.children):
+            label = _label(node)
+            if _DATE.match(label):
+                return label
+        glyphs = read_digits(self._text_crop(screen)).replace(" ", "")
+        date = _DATE.match(glyphs)
+        if not date:
+            return ""
+        clock = _CLOCK.search(glyphs[date.end():])
+        return f"{date[1]} {clock[1]}" if clock else date[1]
+
+    def price(self, screen):
+        for node in (self.node, *self.children):
+            label = _label(node)
+            match = _PRICE.search(label)
+            if match:
+                return int((match[1] or match[2]).replace(",", ""))
+            if label.isascii() and label.isdecimal() and "price" in _id(node):
+                return int(label)
+        groups = re.findall(r"[0-9]+", read_digits(self._text_crop(screen)).replace(" ", ""))
+        return int(groups[0]) if len(groups) == 1 and len(groups[0]) >= 2 else None
+
+
+def _target(cards, screen, read_label, matches):
+    selected = [card for card in cards if card.native_selected()]
+    if not selected:
+        selected = [card for card in cards if card.selected_border(screen)]
+    if len(selected) > 1:
+        return None, False
+    if selected and matches(read_label(selected[0], screen)):
+        return selected[0], True
+    candidates = [card for card in cards if matches(read_label(card, screen))]
+    return (candidates[0], False) if len(candidates) == 1 else (None, False)
+
+
+def _active_confirm(node, screen):
+    crop = _crop(screen(), node.bounds)
+    if not crop.size or not node.enabled:
+        return False
+    r, g, b = (crop[..., i] for i in range(3))
+    return ((r >= 230) & (g < .62 * r) & (b < .34 * r)).mean() >= .20
+
+
+def _read_confirm(nodes, bottom, capture) -> Selection:
+    if bottom is None or not bottom.enabled:
+        return Selection("wait", reason="选票页底栏未就绪")
+    controls = [n for n in nodes if _under(n, bottom)]
+    confirm = next((n for n in controls if _label(n) == "确定"), None)
+    if confirm is None:
+        button = next((n for n in controls if _id(n) == "btn_buy_view" and n.enabled), None)
+        if button and _active_confirm(button, capture):
+            confirm = button
+    if confirm and confirm.enabled:
+        return Selection("confirm", confirm.center)
+    return Selection("wait", reason="确定按钮暂不可用")
+
+
+def read_confirm(nodes, capture, _task) -> Selection:
+    """仅定位选票页可用的确认按钮，使用页面已有的预约选中项。"""
+    return _read_confirm(nodes, next((n for n in nodes if _id(n) == _BOTTOM), None), capture)
+
+
+def read_selection(nodes, capture, task) -> Selection:
+    """每次读取基于同一组控件与最多一帧画面。"""
+    frame = None
+
+    def screen():
+        nonlocal frame
+        if frame is None:
+            frame = capture()
+        return frame
+
+    by_id = {}
+    for node in nodes:
+        by_id.setdefault(_id(node), []).append(node)
+
+    def first(rid):
+        return next(iter(by_id.get(rid, ())), None)
+
+    title = first("title_tv")
+    if title and _label(title) and (task.show_name not in _label(title)
+                                     or (task.city and task.city not in _label(title))):
+        return Selection("blocked", reason="选票页演出或城市不符")
+
+    def cards(rid):
+        container = first(rid)
+        return [_Card(n, nodes) for n in by_id.get(_CARD, ()) if container and _under(n, container)]
+
+    if task.session:
+        session, selected = _target(cards(_SESSION_LIST), screen, _Card.session,
+                                    lambda label: session_matches(task.session, label))
+        if not session:
+            return Selection("wait", reason=f"无法核对场次 {task.session}")
+        if session.unavailable():
+            return Selection("sold_out", reason=f"目标场次 {task.session} 不可购买")
+        if not selected:
+            return Selection("session", session.node.center) if session.node.enabled else Selection("wait")
+
+    price_text = task.price_tiers[0]
+    if not re.fullmatch(r"[0-9]+", price_text) or int(price_text) <= 0:
+        return Selection("blocked", reason="任务的目标票档金额无效")
+    wanted = int(price_text)
+    price, selected = _target(cards(_PRICE_LIST), screen, _Card.price, lambda amount: amount == wanted)
+    if not price:
+        return Selection("wait", reason=f"无法核对目标票档 ¥{wanted}")
+    if price.unavailable():
+        return Selection("sold_out", reason=f"目标票档 ¥{wanted} 显示缺货")
+    if not selected:
+        return Selection("price", price.node.center) if price.node.enabled else Selection("wait")
+
+    bottom = first(_BOTTOM)
+    if not bottom:
+        return Selection("wait", reason="选票页底栏未出现")
+    total_node = next((n for n in by_id.get("tv_price", ()) if _under(n, bottom)), None)
+    amount = _label(total_node).replace(",", "") if total_node else ""
+    if not re.fullmatch(r"[0-9]+(?:\.0+)?", amount):
+        return Selection("wait", reason="无法核对订单合计")
+    total = int(amount.split(".")[0])
+    if total <= 0 or total % wanted:
+        return Selection("wait", reason=f"订单合计 ¥{total} 与票档 ¥{wanted} 无法核对")
+    confirm = _read_confirm(nodes, bottom, screen)
+    if confirm.action == "confirm":
+        return Selection("confirm", confirm.point, quantity=total // wanted)
+    return confirm

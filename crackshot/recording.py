@@ -26,7 +26,7 @@ def _find_scrcpy():
 
 @contextmanager
 def record_screen(adb: Adb, output: Path, limit_seconds: int):
-    """启动独立录屏进程，退出时发送中断让 MP4 正常封尾。"""
+    """提供录屏进程（启动失败时为 None），退出时中断录屏并保存 MP4。"""
     process = diagnostics = None
     partial = output.with_suffix(".partial.mp4")
     try:
@@ -48,7 +48,7 @@ def record_screen(adb: Adb, output: Path, limit_seconds: int):
         log.warning("录屏启动失败: %s", exc)
 
     try:
-        yield
+        yield process
     finally:
         try:
             if process is not None:

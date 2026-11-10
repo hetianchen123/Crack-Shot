@@ -336,8 +336,6 @@ class RunManager:
             runner = TaskRunner(global_cfg, task_cfg, adb, dev, notifier,
                                 evidence_dir, dry_run=dry_run,
                                 stop_check=cancel.is_set, phase_cb=phase,
-                                ollama_url=settings.get("ollama_url", "http://127.0.0.1:11434"),
-                                vlm_model=settings.get("vlm_model") or "qwen3-vl:4b-instruct",
                                 guard_only=dry_run and not manual,
                                 recording_path=self.recording_path(run_id))
             outcome = runner.run(ignore_schedule=manual)

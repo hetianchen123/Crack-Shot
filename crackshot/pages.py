@@ -21,6 +21,7 @@ class PageState(Enum):
     TIER_SHEET = "tier_sheet"        # 选票浮层（场次/票档/确定）
     ORDER_CONFIRM = "order_confirm"  # 确认订单页（观演人/提交订单）
     ORDER_RETRY = "order_retry"      # 提交拥挤弹窗，明确允许继续尝试
+    TICKET_NOTICE = "ticket_notice"
     QUEUE = "queue"                  # 排队中
     SUCCESS = "success"              # 下单成功/待支付
     ERROR_DIALOG = "error_dialog"    # 失败/售罄等提示弹窗
@@ -67,6 +68,8 @@ def _is_detail_page(device: Device) -> Optional[str]:
 def recognize(device: Device, task: TaskConfig) -> PageSnapshot:
     if device.exists_contains_any(task.captcha_texts):
         return PageSnapshot(PageState.CAPTCHA, "验证码关键词")
+    if ticket_notice_button(device):
+        return PageSnapshot(PageState.TICKET_NOTICE, "详情页票务或实名制观演提示")
     if device.exists_contains_any(SUCCESS_MARKERS):
         return PageSnapshot(PageState.SUCCESS, _hit_contains(device, SUCCESS_MARKERS))
     payment = _hit(device, PAYMENT_LABELS)
@@ -101,6 +104,14 @@ def recognize(device: Device, task: TaskConfig) -> PageSnapshot:
     if hint:
         return PageSnapshot(PageState.DETAIL, f"详情页特征:{hint}")
     return PageSnapshot(PageState.UNKNOWN, "")
+
+
+def ticket_notice_button(device):
+    real_name_notice = (device.find(["实名制观演"])
+                        or device.exists_contains_any(["本项目需要实名制购票及入场"]))
+    if real_name_notice and device.find(["预选实名观演人"]):
+        return device.find(["知道了"])
+    return device.find(["确认并知悉"])
 
 
 def _hit(device: Device, texts: List[str]) -> Optional[str]:

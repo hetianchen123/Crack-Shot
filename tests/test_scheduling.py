@@ -16,15 +16,20 @@ from crackshot.timeutil import parse_local
 from crackshot.web import db, runner
 from crackshot.web.app import create_app
 from crackshot.reservation import ReservationUnavailable
+from crackshot.pages import PageState, recognize
+from crackshot.tiers import read_selection
 
 SHOW = "示例巡演"
 SALE = "2026-11-09 15:00:00"
 SALE_MS = int(parse_local(SALE).timestamp() * 1000)
 
 
-def node(label="", rid="", bounds="[0,0][1080,2400]", children="", clazz=""):
+def node(label="", rid="", bounds="[0,0][1080,2400]", children="", clazz="", selected=False,
+         enabled=True, checked=False):
     return (f'<node text="{label}" resource-id="{rid}" bounds="{bounds}"'
-            f' enabled="true" clickable="true" class="{clazz}">{children}</node>')
+            f' enabled="{str(enabled).lower()}" clickable="true" class="{clazz}"'
+            f' checked="{str(checked).lower()}"'
+            f' selected="{str(selected).lower()}">{children}</node>')
 
 
 def device_with_xml(xml):
@@ -79,6 +84,33 @@ class SearchTests(unittest.TestCase):
         self.assertTrue(navigator.is_target_detail(detail("杭州"), self.task))
         self.assertFalse(navigator.is_target_detail(detail("宁波"), self.task))
 
+    def test_real_name_notice_closes_only_the_acknowledgement(self):
+        dev = device_with_xml(lambda: node(children=
+            node("实名制观演") + node("预选实名观演人", bounds="[100,1300][900,1400]")
+            + node("知道了", bounds="[100,1420][900,1500]")))
+        taps = []
+        self.assertEqual(recognize(dev, self.task).state, PageState.TICKET_NOTICE)
+        self.assertTrue(navigator.dismiss_ticket_notice(dev, SimpleNamespace(tap=lambda *xy: taps.append(xy))))
+        self.assertEqual(taps, [(500, 1460)])
+
+    def test_native_confirm_requires_exact_selected_tier_and_consistent_total(self):
+        task = TaskConfig("test", SHOW, SALE, ["480"], city="杭州", session="2027-01-09 19:30")
+        def checkout(amount):
+            return device_with_xml(lambda: node(children=
+                node(f"{SHOW} · 杭州站", "title_tv")
+                + node(rid="project_detail_perform_flowlayout", children=
+                    node("2027-01-09 周六 19:30", "ll_perform_item", selected=True))
+                + node(rid="project_detail_perform_price_flowlayout", children=
+                    node("看台480元", "ll_perform_item", selected=True)
+                    + node("看台680元", "ll_perform_item"))
+                + node(rid="id_sku_bottom_bar_container", children=node(amount, "tv_price")
+                    + node("确定", bounds="[600,2100][1000,2240]"))))
+        def no_capture():
+            self.fail("控件已经给出确认信息，不应截图")
+        result = read_selection(checkout("960").elements(), no_capture, task)
+        self.assertEqual((result.action, result.point, result.quantity), ("confirm", (800, 2170), 2))
+        self.assertEqual(read_selection(checkout("680").elements(), no_capture, task).action, "wait")
+
 
 class SchedulingTests(unittest.TestCase):
     def setUp(self):
@@ -92,6 +124,8 @@ class SchedulingTests(unittest.TestCase):
         self.taps = []
         self.wakes = []
         self.recording_starts = []
+        self.recording_stops = []
+        self.evidence_times = []
         self.patches = [
             patch("crackshot.web.app.now_ms", lambda: self.now),
             patch.object(runner, "now_ms", lambda: self.now),
@@ -119,8 +153,9 @@ class SchedulingTests(unittest.TestCase):
     def fake_record_screen(self, _adb, path, _limit_seconds):
         self.recording_starts.append(self.now)
         try:
-            yield
+            yield SimpleNamespace(poll=lambda: None)
         finally:
+            self.recording_stops.append(self.now)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"test recording")
 
@@ -146,6 +181,7 @@ class SchedulingTests(unittest.TestCase):
             self.taps.append((self.now, point))
             self.state = "captcha"
         def screenshot(path):
+            self.evidence_times.append(self.now)
             Path(path).write_bytes(b"simulated")
         return SimpleNamespace(wake=lambda: self.wakes.append(self.now),
                                is_damai_foreground=lambda: True,
@@ -220,6 +256,8 @@ class SchedulingTests(unittest.TestCase):
         run = self.wait_run(tid)
         self.assertEqual(run["outcome"], "needs_human")
         self.assertEqual(self.recording_starts, [SALE_MS - 300000])
+        self.assertEqual(len(self.evidence_times), 1)
+        self.assertEqual(self.recording_stops, [self.evidence_times[0] + 60_000])
         video = self.request("GET", f"/api/runs/{run['id']}")["recording_url"]
         self.assertEqual(self.request("GET", video, expected=206, raw=True,
                                       headers=((b"range", b"bytes=0-3"),)), b"test")
@@ -253,20 +291,52 @@ class SchedulingTests(unittest.TestCase):
         self.assertEqual((task["session"], task["price_tiers"]), ("2026-11-28 19:30", ["588"]))
         self.assertEqual(task["calibration"]["reservation_price"], "588")
 
-    def test_selecting_target_date_does_not_use_tiers_from_previous_date(self):
+    def test_confirm_uses_current_selection_without_reading_price_or_date(self):
+        self.now = SALE_MS
         task = TaskConfig("test", SHOW, SALE, ["688"], session="2026-11-28")
-        dev = device_with_xml(lambda: node("票档"))
+        enabled = False
+        dev = device_with_xml(lambda: node(children=node("确定", bounds="[50,450][100,550]")
+            + node(rid="id_sku_bottom_bar_container", children=
+                   node("确定", bounds="[600,2100][1000,2240]", enabled=enabled))))
         adb = self.adb()
-        adb.screencap_bytes = lambda: b"test"
-        layout = {"sessions": [
-            {"text": "2026-11-29 周日 19:30", "selected": True, "x": 400, "y": 700},
-            {"text": "2026.11.28 周六 19:30", "selected": False, "x": 400, "y": 500},
-        ], "tiers": [{"price": "688", "in_stock": True, "x": 400, "y": 1200}]}
-        instance = grabber.Grabber(adb, dev, task, SimpleNamespace(), Path(self.tmp.name),
-                                   tier_parser=lambda *_: layout)
+        adb.screencap_raw = lambda: self.fail("可直接使用确定控件，不应截图核对")
+        instance = grabber.Grabber(adb, dev, task, SimpleNamespace(), Path(self.tmp.name))
+        instance.deadline_ms = SALE_MS + 10000
         self.assertIsNone(instance._from_tier_sheet())
-        self.assertEqual(len(self.taps), 1)
-        self.assertLess(self.taps[0][1][1], 600)
+        self.assertEqual(self.taps, [])
+        enabled = True
+        dev.refresh()
+        clicked_at = self.now
+        self.assertIsNone(instance._from_tier_sheet())
+        self.assertEqual(self.taps, [(clicked_at, (800, 2170))])
+
+    def test_order_retry_shares_cooldown_and_caps_submissions(self):
+        self.now = SALE_MS
+        task = TaskConfig("test", SHOW, SALE, ["688"])
+        submit = node("立即提交", bounds="[700,2100][1000,2240]")
+        retry = node("继续尝试", bounds="[500,1200][800,1320]") + node("返回重新选购")
+        dev = device_with_xml(lambda: submit + node(clazz="android.widget.CheckBox", checked=True)
+                              + (retry if self.state == "retry" else ""))
+        messages = []
+        adb = self.adb()
+        def tap(x, y):
+            self.taps.append((self.now - SALE_MS, (x, y)))
+            self.state = "retry" if y == 2170 else "order"
+        adb.tap = tap
+        instance = grabber.Grabber(adb, dev, task, SimpleNamespace(critical=messages.append),
+                                   Path(self.tmp.name))
+        instance.deadline_ms = SALE_MS + 30000
+        self.state = "order"
+        def attempt(offset):
+            self.now = SALE_MS + offset
+            dev.refresh(fast=True)
+            return instance._attempt()
+        for offset in (0, 799, 800, 1599, 1600, 2400, 3200, 4000, 4800):
+            self.assertIsNone(attempt(offset))
+        self.assertEqual(attempt(5600), grabber.GrabOutcome.NEEDS_HUMAN)
+        self.assertEqual(self.taps, [(i * 800, (850, 2170) if i % 2 == 0 else (650, 1260))
+                                     for i in range(7)])
+        self.assertIn("已提交 4 次", messages[0])
 
     def test_timed_rehearsal_does_not_click_or_requeue(self):
         tid = self.create_draft()
@@ -302,7 +372,7 @@ class SchedulingTests(unittest.TestCase):
         dev._d.dump_hierarchy = lambda: self.fail("热路径不应调用带秒级重试的读取")
         notifier = SimpleNamespace(critical=lambda _: None)
         instance = grabber.Grabber(adb, dev, task, notifier, Path(self.tmp.name),
-                                   tier_parser=lambda *_: self.fail("不应解析缺货登记页"))
+                                   tier_reader=lambda *_: self.fail("不应解析缺货登记页"))
         self.assertEqual(instance.run(SALE_MS, verify_detail=True), "sold_out")
         self.assertEqual(probe_times, [SALE_MS - 750])
         self.assertEqual([tap[0] for tap in self.taps], [SALE_MS + 100])
@@ -320,6 +390,23 @@ class SchedulingTests(unittest.TestCase):
                                    Path(self.tmp.name), stop_check=lambda: self.now > SALE_MS + 300)
         self.assertEqual(instance.run(SALE_MS, verify_detail=True), "sold_out")
         self.assertEqual(self.taps, [])
+
+    def test_opening_uses_ready_parallel_frame_without_another_capture(self):
+        self.now = SALE_MS + 800
+        task = TaskConfig("test", SHOW, SALE, ["688"], city="杭州")
+        dev = device_with_xml(lambda: node(children=
+            node(f"{SHOW} · 杭州站", "info_v2_title") +
+            node("", "purchase_status_bar", "[320,2200][1050,2360]")))
+        adb = self.adb()
+        adb.screencap_raw = lambda: self.fail("不应再读一帧")
+        instance = grabber.Grabber(adb, dev, task, SimpleNamespace(), Path(self.tmp.name))
+        instance.deadline_ms = SALE_MS + 10000
+        instance._sale_at_ms = SALE_MS
+        instance._verify_detail = True
+        instance._opening_probe = SimpleNamespace(
+            result=lambda _: ((340, 2210, 1020, 2350), 800), close=lambda: None)
+        self.assertIsNone(instance._attempt())
+        self.assertEqual([tap[0] for tap in self.taps], [SALE_MS + 800])
 
     def test_calibration_never_overwrites_existing_device_owner(self):
         tid = self.create_draft()

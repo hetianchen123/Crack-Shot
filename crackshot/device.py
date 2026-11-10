@@ -26,6 +26,7 @@ class Element:
     clazz: str = ""
     parent: Optional["Element"] = field(default=None, repr=False, compare=False)
     checked: bool = False
+    selected: bool = False
 
     @property
     def center(self) -> Tuple[int, int]:
@@ -64,7 +65,8 @@ def _parse_nodes(xml: str) -> List[Element]:
                              attrs.get("class", ""), parent,
                              attrs.get("checked") == "true" and
                              (attrs.get("checkable") == "true"
-                              or "checkbox" in attrs.get("class", "").lower()))
+                              or "checkbox" in attrs.get("class", "").lower()),
+                             attrs.get("selected") == "true")
             nodes.append(parent)
         for child in xml_node:
             visit(child, parent)

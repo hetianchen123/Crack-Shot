@@ -39,6 +39,10 @@ def find_buy_button(png_bytes: bytes) -> Optional[BBox]:
     scale = 2
     small = img.resize((w // scale, h // scale))
     arr = np.asarray(small, dtype=np.int16)
+    return _find_buy_button(arr, scale)
+
+
+def _find_buy_button(arr, scale):
     top = int(arr.shape[0] * _SEARCH_TOP_RATIO)
     region = arr[top:, :, :]
     r, g, b = region[:, :, 0], region[:, :, 1], region[:, :, 2]
@@ -59,6 +63,29 @@ def find_buy_button(png_bytes: bytes) -> Optional[BBox]:
     if x2 - x1 < 40 or y2 - y1 < 30:  # 太小不是按钮
         return None
     return (x1, y1, x2, y2)
+
+
+def opening_frame(raw) -> tuple:
+    """定位按钮并提取文字区域的白色像素，用于剔除未变化的预约画面。"""
+    width, height, data = raw
+    pixels = np.frombuffer(data, dtype=np.uint8).reshape(height, width, 4)
+    bbox = _find_buy_button(pixels[::2, ::2, :3], 2)
+    if not bbox:
+        return None, None
+    left, top, right, bottom = bbox
+    dx, dy = (right - left) // 5, (bottom - top) // 10
+    crop = pixels[top + dy:bottom - dy, left + dx:right - dx, :3]
+    white = np.all(crop >= 230, axis=-1)
+    glyphs = np.asarray(Image.fromarray(white).resize((96, 32), Image.Resampling.NEAREST))
+    return bbox, glyphs
+
+
+def button_text_changed(before, after) -> bool:
+    if before is None or after is None:
+        return False
+    union = np.count_nonzero(before | after)
+    return (np.count_nonzero(before) >= 24 and np.count_nonzero(after) >= 24
+            and np.count_nonzero(before ^ after) >= .35 * union)
 
 
 def random_point(bbox: BBox, margin: float = 0.18) -> Tuple[int, int]:

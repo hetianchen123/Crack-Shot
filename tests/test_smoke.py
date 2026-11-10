@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -16,6 +18,7 @@ from crackshot.device import Element
 from crackshot.grabber import GrabOutcome, Grabber
 from crackshot.notify import SilentNotifier
 from crackshot.pages import recognize  # noqa: F401 —— 确认可导入
+from crackshot.tiers import Selection
 
 
 class World:
@@ -55,6 +58,9 @@ class FakeDevice:
 
     def refresh(self):
         pass  # 假设备按剧本推进，无需快照失效
+
+    def elements(self):
+        return list(self.world.scene["elements"].values())
 
     def find_by_id(self, substr):
         for el in self.world.scene["elements"].values():
@@ -125,17 +131,16 @@ def build_task():
     return cfg.tasks[0]
 
 
-def fake_tier_parser(png, url, model):
-    # 固定布局：688 有票（坐标对应场景元素的“¥668”位置附近）
-    return {"sessions": [], "notes": "",
-            "tiers": [{"price": "688", "in_stock": True, "cx": 160, "cy": 387,
-                       "x": 190, "y": 930}]}
-
 def run_grabber(scenes, task, button_bboxes=None):
     world = World(scenes)
     bboxes = list(button_bboxes or [])
     def fake_finder(png):
         return bboxes.pop(0) if bboxes else None
+    def fake_selection(nodes, _capture, _task):
+        if any(n.text == "缺货登记" for n in nodes):
+            return Selection("sold_out", reason="目标票档缺货")
+        confirm = next(n for n in nodes if n.text == "确定")
+        return Selection("confirm", confirm.center, quantity=1)
     grabber = Grabber(
         adb=FakeAdb(world),
         device=FakeDevice(world),
@@ -144,14 +149,22 @@ def run_grabber(scenes, task, button_bboxes=None):
         evidence_dir=Path("/tmp/crackshot-test-evidence"),
         dry_run=False,
         button_finder=fake_finder,
-        tier_parser=fake_tier_parser,
+        tier_reader=fake_selection,
     )
-    grabber.deadline_ms = 10**13  # 测试中不过期
-    outcome = None
-    for _ in range(30):
-        outcome = grabber._attempt()
-        if outcome:
-            return world, outcome
+    clock = 10000
+
+    def advance(seconds):
+        nonlocal clock
+        clock += round(seconds * 1000)
+
+    grabber.deadline_ms = clock + 30000
+    with patch("crackshot.grabber.now_ms", lambda: clock), \
+         patch("crackshot.grabber.time", SimpleNamespace(sleep=advance)), \
+         patch("crackshot.grabber.sleep_jitter", lambda interval: advance(interval[0] / 1000)):
+        for _ in range(100):
+            outcome = grabber._attempt()
+            if outcome:
+                return world, outcome
     return world, "no-outcome"
 
 
@@ -161,13 +174,7 @@ def test_happy_path():
         # 详情页：立即预订可点
         make_scene({"演出标题": ((100, 1800, 400, 1900), True, True, "演出标题",
                                 "cn.damai:id/info_v2_title")}),
-        # 选票页：688 票档 + 确定（两幕：点票档后浮层仍在，再点确定）
-        make_scene(
-            {"¥688": ((80, 900, 300, 960), True, True, "¥688"),
-             "确定": ((800, 2000, 1000, 2060), True, True, "确定"),
-             "票档": ((80, 880, 200, 930), False, True, "票档")},
-            extra_texts=["每笔订单限购"],
-        ),
+        # 选票页：预约票档已预选，直接点确定
         make_scene(
             {"¥688": ((80, 900, 300, 960), True, True, "¥688"),
              "确定": ((800, 2000, 1000, 2060), True, True, "确定"),
@@ -186,8 +193,8 @@ def test_happy_path():
     button_bbox = (340, 2240, 1124, 2368)
     world, outcome = run_grabber(scenes, task, button_bboxes=[button_bbox])
     assert outcome == GrabOutcome.SUCCESS, outcome
-    # 点击序列：视觉按钮随机点 → 票档 → 确定 → 提交订单
-    assert len(world.taps) == 4, world.taps
+    # 点击序列：可购按钮 → 确定 → 提交订单
+    assert len(world.taps) == 3, world.taps
     bx = world.taps[0]
     assert button_bbox[0] <= bx[0] <= button_bbox[2], world.taps  # 第一点落在按钮内
     print("✓ 成功路径: 视觉定位+随机点击完成下单", world.taps)
@@ -245,6 +252,16 @@ def test_pending_submit_does_not_double_tap():
     print("✓ 提交结果未明确时只点击一次")
 
 
+def test_retry_popup_that_stays_open_is_not_clicked_twice():
+    task = build_task()
+    submit = {"立即提交": ((600, 2200, 1000, 2280), True, True, "立即提交")}
+    retry = {"继续尝试": ((400, 1300, 850, 1380), True, True, "继续尝试")}
+    world, outcome = run_grabber([make_scene(submit), make_scene({**submit, **retry})], task)
+    assert outcome == GrabOutcome.NEEDS_HUMAN
+    assert world.taps == [(800, 2240), (625, 1340)]
+    print("✓ 继续尝试弹窗未关闭时只点击一次")
+
+
 def test_button_inactive_waits():
     task = build_task()
     # 详情页但按钮未激活（视觉无橙色块）：应只等待（不点击、不 back）
@@ -262,5 +279,6 @@ if __name__ == "__main__":
     test_sold_out_tier_stops()
     test_order_retry_and_payment()
     test_pending_submit_does_not_double_tap()
+    test_retry_popup_that_stays_open_is_not_clicked_twice()
     test_button_inactive_waits()
     print("\n全部冒烟测试通过")

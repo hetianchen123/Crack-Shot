@@ -21,6 +21,8 @@ from .timeutil import LOCAL_TZ, epoch_ms, format_remaining, now_ms
 
 log = logging.getLogger("crackshot.scheduler")
 
+_RECORDING_TAIL_SECONDS = 60
+
 
 def sleep_until(target_ms: int, label: str = "", stop_check=None) -> bool:
     """分片睡眠到目标时刻，过程打印倒计时；被要求停止时返回 True。"""
@@ -57,8 +59,6 @@ class TaskRunner:
         dry_run: bool = False,
         stop_check=None,
         phase_cb=None,
-        ollama_url: str = "http://127.0.0.1:11434",
-        vlm_model: str = "qwen3-vl:4b-instruct",
         guard_only: bool = False,
         recording_path: Optional[Path] = None,
     ):
@@ -70,13 +70,10 @@ class TaskRunner:
         self.dry_run = dry_run
         self.stop_check = stop_check
         self.phase_cb = phase_cb
-        self.ollama_url = ollama_url
-        self.vlm_model = vlm_model
         self.guard_only = guard_only
         self.recording_path = recording_path
         self.grabber = Grabber(adb, device, task, notifier, evidence_root,
-                               dry_run, stop_check=stop_check,
-                               ollama_url=ollama_url, vlm_model=vlm_model)
+                               dry_run, stop_check=stop_check)
 
     def _phase(self, name: str) -> None:
         if self.phase_cb:
@@ -97,11 +94,21 @@ class TaskRunner:
             return GrabOutcome.CANCELLED
 
         until_sale = 0 if ignore_schedule else max(0, on_sale_ms - now_ms()) // 1000
-        limit_seconds = until_sale + self.task.max_retry_seconds + self.task.queue_wait_seconds + 180
+        limit_seconds = (until_sale + self.task.max_retry_seconds + self.task.queue_wait_seconds
+                         + self.task.post_submit_watch_seconds + 180 + _RECORDING_TAIL_SECONDS)
         recording = (record_screen(self.adb, self.recording_path, limit_seconds)
                      if self.recording_path and not self.dry_run else nullcontext())
-        with recording:
-            return self._run_active(on_sale_ms, ignore_schedule)
+        with recording as process:
+            outcome = self._run_active(on_sale_ms, ignore_schedule)
+            if outcome != GrabOutcome.CANCELLED and process is not None:
+                def tail_should_stop():
+                    return process.poll() is not None or (self.stop_check and self.stop_check())
+
+                if not tail_should_stop():
+                    log.info("自动操作已结束（%s），继续录屏 %d 秒", outcome, _RECORDING_TAIL_SECONDS)
+                    sleep_until(now_ms() + _RECORDING_TAIL_SECONDS * 1000,
+                                stop_check=tail_should_stop)
+        return outcome
 
     def _run_active(self, on_sale_ms: int, ignore_schedule: bool) -> str:
         if ignore_schedule:

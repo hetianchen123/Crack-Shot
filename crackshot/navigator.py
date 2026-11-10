@@ -15,7 +15,7 @@ from .adb import Adb, AdbError, DAMAI_LAUNCH_ACTIVITY
 from .config import TaskConfig
 from .device import Device, Element
 from .notify import Notifier
-from .pages import PageSnapshot, PageState, recognize
+from .pages import PageSnapshot, PageState, recognize, ticket_notice_button
 from .timeutil import sleep_jitter
 
 log = logging.getLogger("crackshot.navigator")
@@ -260,18 +260,14 @@ def is_target_detail(device: Device, task: TaskConfig, snap: Optional[PageSnapsh
 
 
 def dismiss_ticket_notice(device: Device, adb: Adb) -> bool:
-    """关闭「票务须知」强制弹窗（首次进入城市站必弹，挡住整个详情页）。
-
-    这是导航失败的真凶：弹窗存在时详情页特征全部不可见。用户完成过
-    预约即已同意条款，点击「确认并知悉」无副作用。
-    """
-    _snapshot_retry(device)
-    btn = device.find(["确认并知悉"])
-    if not btn:
+    """只关闭已识别的提示，保留用户预选的观演人。"""
+    btn = ticket_notice_button(device)
+    if not btn or not btn.enabled:
         return False
-    log.info("关闭票务须知弹窗 @%s", btn.center)
+    log.info("关闭详情页提示：%s @%s", _label(btn), btn.center)
     adb.tap(*btn.center)
-    sleep_jitter((1.2, 2.0))
+    time.sleep(.20)
+    device.refresh(fast=True)
     return True
 
 
