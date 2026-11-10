@@ -4,22 +4,30 @@
 """
 
 import logging
+import re
+import sys
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 # 注意：本文件不能用 `from __future__ import annotations`——
 # Pydantic 模型定义在 create_app 内部，字符串注解无法解析到局部类，
 # FastAPI 会把 body 参数误当成 query 参数。
 
+from ..adb import Adb, find_adb
 from ..config import TaskConfig
+from ..device import Device
+from ..login import LoginError, login_with_password
 from ..timeutil import now_ms, parse_local
 from . import db, extractor
+from .credentials import CredentialError, DeviceCredentials
 from .runner import DBLogHandler, RunManager, SCHEDULED_STATUSES, format_time, schedule_times
 
 log = logging.getLogger("crackshot.web")
@@ -27,9 +35,18 @@ log = logging.getLogger("crackshot.web")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
+def _require_local_login(request: Request) -> None:
+    origin = request.headers.get("origin")
+    if (not request.client or request.client.host not in {"127.0.0.1", "::1"}
+            or request.url.hostname not in {"localhost", "127.0.0.1", "::1"}
+            or (origin is not None and origin != str(request.base_url).rstrip("/"))):
+        raise HTTPException(403, "大麦登录配置只能从本机后台操作")
+
+
 def create_app(db_path: Path) -> FastAPI:
     db.init(db_path)
     manager = RunManager(db_path)
+    credentials = DeviceCredentials(db_path)
 
     app = FastAPI(title="Crack-shot 后台", docs_url="/api/docs")
     app.state.run_manager = manager
@@ -148,10 +165,92 @@ def create_app(db_path: Path) -> FastAPI:
                          enabled=body.enabled, note=body.note)
         return {"ok": "1"}
 
+    @contextmanager
+    def login_device(device_id: int):
+        try:
+            with manager.reserve_device(device_id) as device:
+                yield device
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        except CredentialError as exc:
+            raise HTTPException(503, str(exc)) from None
+
     @app.delete("/api/devices/{device_id}")
-    def delete_device(device_id: int) -> Dict[str, str]:
-        db.delete_device(device_id)
+    def delete_device(device_id: int, request: Request) -> Dict[str, str]:
+        if not db.get_device(device_id):
+            return {"ok": "1"}
+        with login_device(device_id) as device:
+            if sys.platform == "darwin":
+                _require_local_login(request)
+                credentials.delete(device)
+            db.delete_device(device_id)
         return {"ok": "1"}
+
+    @app.get("/api/devices/{device_id}/login")
+    def get_device_login(device_id: int, request: Request) -> Dict[str, Any]:
+        _require_local_login(request)
+        with login_device(device_id) as device:
+            saved = credentials.read(device)
+            return {"configured": saved is not None, "phone_tail": saved[0][-4:] if saved else ""}
+
+    @app.put("/api/devices/{device_id}/login")
+    async def save_device_login(device_id: int, request: Request) -> Dict[str, str]:
+        _require_local_login(request)
+        if request.headers.get("content-type", "").split(";", 1)[0] != "application/json":
+            raise HTTPException(415, "登录配置需要 JSON")
+        try:
+            body = await request.json()
+        except ValueError:
+            raise HTTPException(400, "登录配置无效") from None
+        phone = body.get("phone") if isinstance(body, dict) else None
+        password = body.get("password") if isinstance(body, dict) else None
+        if not isinstance(phone, str) or not re.fullmatch(r"[0-9]{6,15}", phone):
+            raise HTTPException(400, "手机号请输入 6 到 15 位数字，无需填写区号")
+        if not isinstance(password, str) or not 1 <= len(password) <= 256:
+            raise HTTPException(400, "请输入密码")
+
+        def save():
+            with login_device(device_id) as device:
+                credentials.save(device, phone, password)
+        await run_in_threadpool(save)
+        return {"ok": "1"}
+
+    @app.delete("/api/devices/{device_id}/login")
+    def delete_device_login(device_id: int, request: Request) -> Dict[str, str]:
+        _require_local_login(request)
+        with login_device(device_id) as device:
+            credentials.delete(device)
+        return {"ok": "1"}
+
+    @app.post("/api/devices/{device_id}/login")
+    def start_device_login(device_id: int, request: Request) -> Dict[str, str]:
+        _require_local_login(request)
+        with login_device(device_id) as device:
+            if not device["enabled"]:
+                raise HTTPException(409, "设备已禁用")
+            saved = credentials.read(device)
+            if not saved:
+                raise HTTPException(409, "请先保存该设备的手机号和密码")
+            adb_path = find_adb()
+            if not adb_path:
+                raise HTTPException(503, "电脑上未找到 adb")
+            try:
+                serial = device["serial"]
+                if not any(d["id"] == serial and d["state"] == "device"
+                           for d in Adb.list_devices(adb_path)):
+                    raise HTTPException(409, "设备不在线或未授权 USB 调试")
+                adb = Adb(adb_path, serial)
+                adb.wake()
+                logged_in = login_with_password(adb, Device(serial), *saved)
+            except HTTPException:
+                raise
+            except LoginError as exc:
+                raise HTTPException(409, str(exc)) from None
+            except Exception:
+                raise HTTPException(502, "无法完成登录，请确认手机已解锁并查看大麦当前页面") from None
+            return {"status": "signed_in" if logged_in else "already_signed_in"}
 
     # ---- 任务 ----------------------------------------------------------
 
@@ -339,7 +438,8 @@ def create_app(db_path: Path) -> FastAPI:
         if len(data) > 12 * 1024 * 1024:
             raise HTTPException(400, "图片超过 12MB")
         try:
-            draft = extractor.extract(data, settings["ollama_url"], settings["vlm_model"])
+            draft = await run_in_threadpool(extractor.extract, data, settings["ollama_url"],
+                                            settings["vlm_model"])
         except RuntimeError as exc:
             raise HTTPException(503, str(exc)) from exc
         return draft

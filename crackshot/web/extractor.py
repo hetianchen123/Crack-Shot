@@ -9,23 +9,47 @@ from __future__ import annotations
 import base64
 import json
 import re
-from pathlib import Path
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
+from unicodedata import normalize
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-PROMPT = """你是一个信息提取助手。这张截图来自大麦App（演出购票）。
-请仔细阅读截图中的文字，提取以下信息并以严格 JSON 返回（不要输出其他内容）：
+PROMPT = """读取大麦 App 的演出详情页或场次/票档预约页截图，只输出 JSON：
 {
-  "show_name": "演出名称关键词（用于在详情页核对的短词，如歌手名+城市，10字以内）",
+  "show_name": "标题里连续出现的简短演出关键词，例如艺人名",
   "full_title": "截图中完整的演出标题",
-  "on_sale_text": "开售/预售/开抢时间相关文字，找不到则空字符串",
-  "sessions": ["场次列表，如 2026-11-28 周六 19:00，没有则空数组"],
-  "price_tiers": ["票档价格数字，如 688、488，按页面出现顺序，只保留数字"],
-  "venue": "场馆名称，找不到则空字符串",
-  "status_text": "底部按钮或状态文字，如 立即预订/即将开抢/缺货登记"
+  "city": "标题或场馆地址中的演出城市，不含市、站等后缀",
+  "venue": "场馆名称",
+  "status_text": "底部主按钮文字，例如 已预约",
+  "sessions": ["所有可见场次的演出日期和时间，保留年份"],
+  "price_tiers": ["所有可见票档的单张票价数字"],
+  "on_sale_text": "页面上未绑定到某个场次的开抢/开售时间原文",
+  "reserved_sessions": [{"session": "已预约卡片第一行的演出日期和时间，保留年份",
+                         "on_sale_text": "同一张卡片里写着开抢/开售的那一行原文"}],
+  "reserved_price_tiers": ["已预约票档的单张票价数字"]
 }
-注意：只提取截图里真实可见的文字，不要编造；价格去掉货币符号只留数字。"""
+先找底部「已预约」。在场次区和票档区分别检查每张卡片右侧的爱心：
+实心橙色/黄色爱心表示已预约，常伴橙色边框和橙色文字。空心爱心（包括加号）
+或仅写「可预约」表示可以预约，不能放入 reserved 字段。保留所有已预约项，无法确认就留空。
+场次卡片的第一行是演出时间；第二行「M月D日 HH:MM开抢」是开票时间，属于该场次，
+不是第二个演出日期。照抄这行，即使没有年份也保留。只提取实际看见的内容，未知填空字符串或空数组。"""
+
+_DATE = r"(?<![0-9])([0-9]{4})\s*[-/.年]\s*([0-9]{1,2})\s*[-/.月]\s*([0-9]{1,2})(?![0-9])日?"
+_MONTH_DAY = r"(?<![0-9])([0-9]{1,2})\s*月\s*([0-9]{1,2})(?![0-9])\s*日"
+_TIME = r"\s*(?:(?:周|星期)[一二三四五六日天]\s*)?([0-9]{1,2}):([0-9]{2})(?![0-9])"
+_STRING = {"type": "string"}
+_STRINGS = {"type": "array", "items": _STRING}
+_FIELDS = {
+    **dict.fromkeys(("show_name", "full_title", "city", "venue", "status_text", "on_sale_text"), _STRING),
+    **dict.fromkeys(("sessions", "price_tiers", "reserved_price_tiers"), _STRINGS),
+    "reserved_sessions": {"type": "array", "items": {
+        "type": "object", "required": ["session", "on_sale_text"],
+        "properties": {"session": _STRING, "on_sale_text": _STRING},
+    }},
+}
+_SCHEMA = {"type": "object", "properties": _FIELDS, "required": list(_FIELDS)}
 
 # 常见视觉模型名关键词（Ollama /api/tags 里按此挑默认值）
 _VISION_HINTS = ("vl", "llava", "minicpm-v", "gemma3", "moondream", "vision", "bakllava")
@@ -73,8 +97,9 @@ def extract(image_bytes: bytes, ollama_url: str, configured_model: str,
             "images": [base64.b64encode(image_bytes).decode("ascii")],
         }],
         "stream": False,
-        "format": "json",
-        "options": {"temperature": 0.1},
+        "think": False,
+        "format": _SCHEMA,
+        "options": {"temperature": 0, "num_ctx": 6144, "num_predict": 700},
     }
     try:
         resp = _request(f"{base}/api/chat", payload, timeout=timeout)
@@ -84,52 +109,112 @@ def extract(image_bytes: bytes, ollama_url: str, configured_model: str,
     parsed = _parse_json(content)
     if not parsed:
         raise RuntimeError("模型未返回有效 JSON，请重试或手动录入")
-    tiers = _clean_tiers(parsed.get("price_tiers"))
-    sessions = [str(s).strip() for s in (parsed.get("sessions") or []) if str(s).strip()]
-    on_sale_text = str(parsed.get("on_sale_text") or "").strip()
+    return {**_draft_fields(parsed), "model": st["model"]}
+
+
+def _draft_fields(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    prices = map(_price, _items(parsed.get("price_tiers")))
+    tiers = list(dict.fromkeys(price for price in prices if price))[:12]
+    sessions = _items(parsed.get("sessions"))
+    reserved = _items(parsed.get("reserved_sessions"))
+    reserved_prices = _items(parsed.get("reserved_price_tiers"))
+    status_text = _text(parsed.get("status_text"))
+    reservation = bool(reserved or reserved_prices
+                       or any(word in status_text for word in ("已预约", "可预约", "取消预约")))
+    card = reserved[0] if len(reserved) == 1 and isinstance(reserved[0], dict) else {}
+    page_sale_text = _text(parsed.get("on_sale_text"))
+    if reservation:
+        session = _session(_text(card.get("session")))
+        price = _price(reserved_prices[0]) if len(reserved_prices) == 1 else ""
+        on_sale_text = _text(card.get("on_sale_text")) if session else ""
+    else:
+        session = _session(_text(sessions[0])) if len(sessions) == 1 else ""
+        price = tiers[0] if len(tiers) == 1 else ""
+        on_sale_text = page_sale_text
     return {
-        "show_name": str(parsed.get("show_name") or "").strip()[:30],
-        "full_title": str(parsed.get("full_title") or "").strip()[:120],
-        "on_sale_text": on_sale_text,
-        "on_sale_guess": _guess_datetime(on_sale_text),
-        "sessions": sessions,
+        "show_name": _text(parsed.get("show_name"))[:30],
+        "full_title": _text(parsed.get("full_title"))[:120],
+        "city": re.sub(r"[市站]$", "", _text(parsed.get("city")))[:30],
+        "on_sale_text": on_sale_text or page_sale_text,
+        "on_sale_guess": _guess_datetime(on_sale_text, session),
+        "session_guess": session,
+        "price_guess": price,
+        "sessions": list(filter(None, map(_text, sessions))),
         "price_tiers": tiers,
-        "venue": str(parsed.get("venue") or "").strip()[:60],
-        "status_text": str(parsed.get("status_text") or "").strip()[:30],
-        "model": st["model"],
+        "venue": _text(parsed.get("venue"))[:60],
+        "status_text": status_text[:30],
     }
 
 
 def _parse_json(content: str) -> Optional[Dict[str, Any]]:
     content = content.strip()
     try:
-        return json.loads(content)
+        value = json.loads(content)
     except ValueError:
-        pass
-    # 模型偶尔包 markdown 代码块
-    match = re.search(r"\{.*\}", content, re.S)
-    if match:
+        # 模型偶尔包 markdown 代码块
+        match = re.search(r"\{.*\}", content, re.S)
+        if not match:
+            return None
         try:
-            return json.loads(match.group(0))
+            value = json.loads(match.group(0))
         except ValueError:
             return None
-    return None
+    return value if isinstance(value, dict) else None
 
 
-def _clean_tiers(raw: Any) -> List[str]:
-    tiers: List[str] = []
-    for item in raw or []:
-        digits = re.sub(r"[^\d]", "", str(item))
-        if digits and digits not in tiers:
-            tiers.append(digits)
-    return tiers[:12]
+def _text(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
 
 
-def _guess_datetime(on_sale_text: str) -> str:
-    """只从明确的开售文字提取开票时间。"""
-    md = re.search(r"(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})日?", on_sale_text)
-    hm = re.search(r"(\d{1,2}):(\d{2})", on_sale_text)
-    if not md or not hm:
+def _items(value: Any) -> List[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _price(value: Any) -> str:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
         return ""
-    date = f"{int(md.group(1)):04d}-{int(md.group(2)):02d}-{int(md.group(3)):02d}"
-    return f"{date} {int(hm.group(1)):02d}:{hm.group(2)}"
+    numbers = re.findall(r"[-+]?[0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?",
+                         normalize("NFKC", str(value)))
+    if len(numbers) != 1:
+        return ""
+    price = Decimal(numbers[0].replace(",", ""))
+    return str(int(price)) if price > 0 and price == price.to_integral_value() else ""
+
+
+def _session(value: str) -> str:
+    text = normalize("NFKC", value)
+    day = re.search(_DATE, text)
+    if not day:
+        return ""
+    clock = re.compile(_TIME).match(text, day.end())
+    try:
+        parts = [int(part) for part in day.groups()]
+        if clock:
+            parts.extend(map(int, clock.groups()))
+            return datetime(*parts).strftime("%Y-%m-%d %H:%M")
+        return date(*parts).isoformat()
+    except ValueError:
+        return ""
+
+
+def _guess_datetime(on_sale_text: str, session: str = "") -> str:
+    """无年份的开售时间用同一场次的演出日期推定，可跨年。"""
+    text = normalize("NFKC", on_sale_text)
+    full = re.search(_DATE + _TIME, text)
+    partial = re.search(_MONTH_DAY + _TIME, text) if not full and session else None
+    anchor = date.fromisoformat(session[:10]) if session else None
+    if full:
+        candidates = [tuple(map(int, full.groups()))]
+    elif partial:
+        fields = tuple(map(int, partial.groups()))
+        candidates = [(anchor.year, *fields), (anchor.year - 1, *fields)]
+    else:
+        return ""
+    for parts in candidates:
+        try:
+            value = datetime(*parts)
+        except ValueError:
+            continue
+        if not anchor or value.date() <= anchor:
+            return value.strftime("%Y-%m-%d %H:%M")
+    return ""

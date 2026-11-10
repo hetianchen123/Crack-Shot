@@ -386,36 +386,48 @@ async function cancelTask(id) {
 async function doExtract() {
   const input = $("#extract-file");
   const statusEl = $("#extract-status");
-  if (!input.files.length) { statusEl.textContent = "请先选择截图"; return; }
+  const file = input.files[0];
+  if (!file) { statusEl.textContent = "请先选择截图"; return; }
   statusEl.textContent = "本地模型识别中…（可能需要几十秒）";
   try {
     const fd = new FormData();
-    fd.append("file", input.files[0]);
+    fd.append("file", file);
     const resp = await fetch("/api/extract", { method: "POST", body: fd });
     if (!resp.ok) throw new Error((await resp.json()).detail || resp.status);
     const draft = await resp.json();
+    if (input.files[0] !== file || !$("#task-dialog").open) return;
     const form = $("#task-form");
-    if (!form.name.value) form.name.value = draft.show_name || "new-task";
-    if (draft.show_name) form.show_name.value = draft.show_name;
-    if (draft.on_sale_guess) form.on_sale_at.value = draft.on_sale_guess;
-    if (draft.price_tiers.length === 1) form.price_tiers.value = draft.price_tiers[0];
-    const dates = [...new Set(draft.sessions.map((session) => {
-      const m = session.match(/(\d{4})[-./年](\d{1,2})[-./月](\d{1,2})/);
-      return m && [m[1], m[2].padStart(2, "0"), m[3].padStart(2, "0")].join("-");
-    }).filter(Boolean))];
-    if (!form.session.value && dates.length === 1 && draft.sessions.length === 1) {
-      form.session.value = dates[0];
+    const fields = {
+      name: draft.show_name,
+      show_name: draft.show_name,
+      city: draft.city,
+      on_sale_at: draft.on_sale_guess,
+      price_tiers: draft.price_guess,
+      session: draft.session_guess,
+    };
+    for (const [key, value] of Object.entries(fields)) {
+      const field = form.elements.namedItem(key);
+      if (!field.value.trim() && value) field.value = value;
     }
+    const missing = [
+      !form.elements.namedItem("price_tiers").value.trim() && "预约票档",
+      !form.elements.namedItem("session").value.trim() && "目标演出日期",
+      !form.elements.namedItem("on_sale_at").value.trim() && "开票时间",
+    ].filter(Boolean);
     const extra = [
       draft.full_title && `完整标题: ${draft.full_title}`,
       draft.sessions.length && `场次: ${draft.sessions.join(" / ")}`,
+      draft.price_tiers.length && `可见票档: ${draft.price_tiers.join(" / ")} 元`,
       draft.on_sale_text && `开售文字: ${draft.on_sale_text}`,
       draft.venue && `场馆: ${draft.venue}`,
       draft.status_text && `按钮: ${draft.status_text}`,
     ].filter(Boolean).join("；");
-    statusEl.textContent = `已提取（${draft.model}）${extra ? "—— " + extra : ""}，请人工核对时间`;
+    const review = missing.length ? `待核对填写：${missing.join("、")}` : "请核对已填内容";
+    statusEl.textContent = `已提取（${draft.model}）${extra ? " · " + extra : ""}。 ${review}`;
   } catch (e) {
-    statusEl.textContent = `提取失败: ${e.message}`;
+    if (input.files[0] === file && $("#task-dialog").open) {
+      statusEl.textContent = `提取失败: ${e.message}`;
+    }
   }
 }
 
@@ -437,6 +449,7 @@ async function renderDevices() {
       <td>${d.online ? "✅" : "❌"}</td>
       <td>${esc(d.note || "")}</td>
       <td><div class="row-actions">
+        <button class="small" onclick="showDeviceLoginConfig(${d.id})">登录配置</button>
         <button class="small" onclick="toggleDevice(${d.id}, ${d.enabled ? 0 : 1})">${d.enabled ? "禁用" : "启用"}</button>
         <button class="small danger" onclick="deleteDevice(${d.id})">删除</button>
       </div></td>
@@ -470,6 +483,105 @@ async function deleteDevice(id) {
   if (!(await confirm("删除设备注册记录？（不影响手机）"))) return;
   await api.del(`/api/devices/${id}`);
   renderDevices();
+}
+
+/* ---------- 大麦登录 ---------- */
+
+const deviceLoginResults = new Map();
+const loginDialog = $("#device-login-dialog");
+const loginForm = $("#device-login-form");
+loginDialog.addEventListener("close", () => loginForm.reset());
+
+async function renderLoginDevices() {
+  const { devices } = await api.get("/api/devices");
+  $("#login-device-list").innerHTML = devices.length ? `<table>
+    <tr><th>设备</th><th>在线</th><th>操作</th><th>登录结果</th></tr>
+    ${devices.map((d) => {
+      const result = deviceLoginResults.get(d.id);
+      return `<tr>
+        <td>${esc(d.model || d.serial)}${d.model ? ` <span class="muted mono">${esc(d.serial)}</span>` : ""}</td>
+        <td>${d.online ? "在线" : "离线"}</td>
+        <td><div class="row-actions">
+          <button class="small" onclick="openDeviceLoginConfig(${d.id})">配置</button>
+          <button class="small primary" id="device-login-btn-${d.id}" onclick="startDeviceLogin(${d.id})"
+            data-available="${Boolean(d.online && d.enabled)}"
+            ${d.online && d.enabled && !result?.pending ? "" : "disabled"}>登录</button>
+        </div></td>
+        <td id="device-login-result-${d.id}" role="status">${esc(result?.message || "")}</td>
+      </tr>`;
+    }).join("")}</table>` : '<div class="empty">请先在「设备」页注册 ADB 设备</div>';
+}
+
+function showDeviceLoginConfig(id) {
+  $('#nav button[data-tab="logins"]').click();
+  openDeviceLoginConfig(id);
+}
+
+async function openDeviceLoginConfig(id) {
+  try {
+    const config = await api.get(`/api/devices/${id}/login`);
+    loginForm.reset();
+    loginForm.device_id.value = id;
+    $("#device-login-error").textContent = "";
+    $("#device-login-hint").textContent = config.configured
+      ? `已保存尾号 ${config.phone_tail} 的登录配置。填写手机号和密码可替换。`
+      : "手机号和密码保存在本机 macOS 钥匙串。";
+    $("#clear-device-login").hidden = !config.configured;
+    if (!loginDialog.open) loginDialog.showModal();
+  } catch (e) { alert(e.message); }
+}
+
+async function saveDeviceLogin(ev) {
+  ev.preventDefault();
+  const id = loginForm.device_id.value;
+  const button = loginForm.querySelector('button[type="submit"]');
+  button.disabled = true;
+  try {
+    await api.put(`/api/devices/${id}/login`, {
+      phone: loginForm.phone.value.trim(),
+      password: loginForm.password.value,
+    });
+    loginDialog.close();
+    showDeviceLoginResult(id, "登录配置已保存");
+  } catch (e) {
+    $("#device-login-error").textContent = e.message;
+  } finally {
+    button.disabled = false;
+  }
+  return false;
+}
+
+async function clearDeviceLogin() {
+  const id = loginForm.device_id.value;
+  try {
+    await api.del(`/api/devices/${id}/login`);
+    loginDialog.close();
+    showDeviceLoginResult(id, "已清除登录配置");
+  } catch (e) {
+    $("#device-login-error").textContent = e.message;
+  }
+}
+
+function showDeviceLoginResult(id, message, pending = false) {
+  deviceLoginResults.set(Number(id), { message, pending });
+  const status = $(`#device-login-result-${id}`);
+  if (status) status.textContent = message;
+}
+
+async function startDeviceLogin(id) {
+  const button = $(`#device-login-btn-${id}`);
+  if (deviceLoginResults.get(id)?.pending) return;
+  if (button) button.disabled = true;
+  showDeviceLoginResult(id, "正在登录，请保持手机解锁…", true);
+  try {
+    const result = await api.post(`/api/devices/${id}/login`);
+    showDeviceLoginResult(id, result.status === "already_signed_in" ? "设备已有登录会话" : "登录成功");
+  } catch (e) {
+    showDeviceLoginResult(id, e.message);
+  } finally {
+    const current = $(`#device-login-btn-${id}`);
+    if (current) current.disabled = current.dataset.available !== "true";
+  }
 }
 
 /* ---------- 账号 ---------- */
@@ -633,6 +745,7 @@ async function refreshAll() {
     if (active === "overview") await renderOverview();
     else if (active === "tasks") await renderTasks();
     else if (active === "devices") { await renderAccounts(); await renderDevices(); }
+    else if (active === "logins") await renderLoginDevices();
     else if (active === "accounts") await renderAccounts();
     else if (active === "runs") await renderRuns();
     else if (active === "settings") await renderSettings();

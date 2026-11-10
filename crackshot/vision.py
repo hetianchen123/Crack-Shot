@@ -29,12 +29,20 @@ _SEARCH_TOP_RATIO = 0.85  # 只在屏幕下 15% 区域找（按钮永远在底�
 BBox = Tuple[int, int, int, int]  # (x1, y1, x2, y2) 原图坐标
 
 
-def find_buy_button(png_bytes: bytes) -> Optional[BBox]:
+def _to_image(data) -> Image.Image:
+    """热路径直接传 PIL.Image（省一次解码）；bytes 兼容旧调用。"""
+    if isinstance(data, bytes):
+        return Image.open(io.BytesIO(data)).convert("RGB")
+    return data.convert("RGB") if data.mode != "RGB" else data
+
+
+def find_buy_button(png) -> Optional[BBox]:
     """在截图底部区域找橙色购买按钮，返回其包围盒；找不到返回 None。
 
+    接受 PIL.Image（fast_screenshot 直传）或 PNG bytes；
     半分辨率处理兼顾速度与精度；单次分析 <10ms（不含截图本身）。
     """
-    img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    img = _to_image(png)
     w, h = img.size
     scale = 2
     small = img.resize((w // scale, h // scale))
@@ -109,6 +117,13 @@ def tap_button_jitter(adb, bbox: BBox, margin: float = 0.18) -> Tuple[int, int]:
 # x 30%~95%、y 93.5%~97.8%（真机 1176x2400 验证与实际按钮容器吻合）
 _BUY_REGION_X = (0.30, 0.95)
 _BUY_REGION_Y = (0.935, 0.978)
+
+
+def buy_region_bbox(size) -> BBox:
+    """底部购买按钮的相对区域转为绝对 bbox（坐标记忆失败时的兜底目标）。"""
+    w, h = size
+    return (int(w * _BUY_REGION_X[0]), int(h * _BUY_REGION_Y[0]),
+            int(w * _BUY_REGION_X[1]), int(h * _BUY_REGION_Y[1]))
 
 
 def tap_bottom_region(adb, size) -> Tuple[int, int]:

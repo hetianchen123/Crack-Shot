@@ -1,4 +1,4 @@
-"""命令行入口：doctor / probe / watch / list / run。"""
+"""命令行入口：doctor / login / probe / watch / list / run。"""
 
 from __future__ import annotations
 
@@ -109,6 +109,27 @@ def cmd_doctor(args) -> int:
     return 0
 
 
+def cmd_login(args) -> int:
+    from .navigator import LoginState, open_phone_login
+
+    cfg = load_cfg(args.config) if Path(args.config).is_file() else GlobalConfig()
+    try:
+        adb = connect_device(cfg)
+        adb.wake()
+        state = open_phone_login(adb, Device(adb.serial))
+    except (AdbError, U2Unavailable) as exc:
+        print(f"检查大麦登录失败：{exc}")
+        return 1
+    if state == LoginState.SIGNED_IN:
+        print("大麦已登录")
+        return 0
+    if state == LoginState.CONSENT_REQUIRED:
+        print("已选择手机号登录，请在手机上确认协议后完成登录")
+    else:
+        print("已打开手机号登录页，请在手机上完成登录")
+    return 2
+
+
 def cmd_probe(args) -> int:
     cfg = load_cfg(args.config)
     adb = connect_device(cfg)
@@ -212,6 +233,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("doctor", help="自检：adb/设备/大麦/依赖")
+    sub.add_parser("login", help="检查大麦登录状态，未登录时打开手机号登录")
     sub.add_parser("list", help="列出任务")
 
     p_probe = sub.add_parser("probe", help="查看当前页面元素与识别结果")
@@ -238,6 +260,7 @@ def main(argv: Optional[list] = None) -> int:
     setup_logging(args.verbose)
     handlers = {
         "doctor": cmd_doctor,
+        "login": cmd_login,
         "probe": cmd_probe,
         "watch": cmd_watch,
         "list": cmd_list,

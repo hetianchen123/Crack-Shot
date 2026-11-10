@@ -13,6 +13,7 @@
     <button data-tab="overview" class="active">总览</button>
     <button data-tab="tasks">任务</button>
     <button data-tab="devices">设备</button>
+    <button data-tab="logins">大麦登录</button>
     <button data-tab="accounts">账号</button>
     <button data-tab="runs">运行记录</button>
     <button data-tab="settings">设置</button>
@@ -100,13 +101,35 @@
   <p class="muted">设备绑定账号后，任务即对应“谁的手机抢谁的票”；一台设备同一时刻只执行一个任务。</p>
 </section>
 
+<!-- 大麦登录 -->
+<section id="tab-logins" class="tab">
+  <h2>设备登录配置</h2>
+  <p class="muted">为已注册的 ADB 设备设置手机号和密码。点击「登录」会在手机上确认大麦登录协议并提交密码，遇到安全验证时请在手机上完成。</p>
+  <div id="login-device-list"></div>
+  <dialog id="device-login-dialog">
+    <form id="device-login-form" onsubmit="return saveDeviceLogin(event)" autocomplete="off">
+      <h3>大麦登录配置</h3>
+      <p class="muted" id="device-login-hint"></p>
+      <label>手机号 <input name="phone" type="tel" inputmode="numeric" pattern="[0-9]{6,15}" required placeholder="手机号，无需填写区号"></label>
+      <label>密码 <input name="password" type="password" autocomplete="new-password" required maxlength="256"></label>
+      <input type="hidden" name="device_id">
+      <p role="status" id="device-login-error"></p>
+      <div class="dialog-actions">
+        <button type="button" id="clear-device-login" onclick="clearDeviceLogin()">清除配置</button>
+        <button type="button" onclick="this.closest('dialog').close()">取消</button>
+        <button type="submit" class="primary">保存</button>
+      </div>
+    </form>
+  </dialog>
+</section>
+
 <!-- 账号 -->
 <section id="tab-accounts" class="tab">
   <div class="toolbar">
     <button class="primary" onclick="openAccountForm()">＋ 新建账号</button>
   </div>
   <div id="account-list"></div>
-  <p class="muted">账号仅作标注（谁的大麦账号、登录在哪台手机），不保存任何密码或凭据。</p>
+  <p class="muted">这里管理账号标注。设备的手机号和密码在「大麦登录」页配置。</p>
   <dialog id="account-dialog">
     <form id="account-form" onsubmit="return submitAccount(event)">
       <h3 id="account-form-title">新建账号</h3>
@@ -150,6 +173,6 @@
     <button type="button" id="confirm-ok" class="primary danger-text">确定</button>
   </div>
 </dialog>
-<script src="/app.js?v=7"></script>
+<script src="/app.js?v=9"></script>
 </body>
 </html>

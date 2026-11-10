@@ -3,7 +3,7 @@
 边界（不可越）：
 - 遇到验证码/风控弹窗立即停止并通知人工，绝不尝试处理；
 - 不点击任何支付/密码类元素（成功页交给人工支付）；
-- 全部点击走 Adb.tap 全局限速；时序全部带随机抖动。
+- 全部点击走 Adb.tap 全局限速；定时首击不加随机等待。
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ log = logging.getLogger("crackshot.grabber")
 
 _BUY_PROBE_LEAD_MS = 750
 _BUY_TRANSITION_MS = 2000
+_FIXED_BUY_TRANSITION_MS = 150
 _UNKNOWN_TRANSITION_EXTRA_MS = 2000
 _ORDER_ACTION_INTERVAL_MS = 800
 _MAX_ORDER_SUBMISSIONS = 4
@@ -78,6 +79,7 @@ class Grabber:
         self._capture_raw = (getattr(adb, "screencap_raw", None)
                              if button_finder is vision.find_buy_button else None)
         self._opening_probe = None
+        self._fixed_buy_bounds = None
         self.deadline_ms = 0
         self.attempts = 0
         self._sale_at_ms = 0
@@ -138,7 +140,13 @@ class Grabber:
         log.info("进入抢票循环，窗口 %s 秒，目标票档 %s",
                  self.task.max_retry_seconds, self.task.price_tiers[:1])
 
-        if verify_detail and self._capture_raw and on_sale_ms - now_ms() >= 1000:
+        # 坐标在开票前读取，到点路径只等待时钟并注入点击。
+        if verify_detail and now_ms() < on_sale_ms:
+            outcome = self._timed_first_click(on_sale_ms)
+            if outcome:
+                return outcome
+        if (not self._fixed_buy_bounds and verify_detail and self._capture_raw
+                and on_sale_ms - now_ms() >= 1000):
             self._opening_probe = OpeningProbe(self._capture_raw, on_sale_ms)
         try:
             return self._run_until_end(on_sale_ms)
@@ -146,6 +154,56 @@ class Grabber:
             if self._opening_probe:
                 self._opening_probe.close()
                 self._opening_probe = None
+
+    def _timed_first_click(self, on_sale_ms: int) -> Optional[str]:
+        """预热确认目标页面和坐标；开票瞬间不读控件、不截图。"""
+        from .navigator import is_target_detail
+
+        if self._stop_requested():
+            return GrabOutcome.CANCELLED
+        self.device.refresh(fast=True)
+        snap = recognize(self.device, self.task)
+        if not is_target_detail(self.device, self.task, snap):
+            self.notify.critical("定时点击准备失败：当前不在目标演出详情页")
+            return GrabOutcome.NEEDS_HUMAN
+        button = self.device.find(self.task.buy_texts)
+        bar = self.device.find_by_id("purchase_status_bar")
+        target = bar or button
+        if not target:
+            self.notify.critical("定时点击准备失败：未找到底部按钮坐标")
+            return GrabOutcome.NEEDS_HUMAN
+        self._fixed_buy_bounds = target.bounds
+        log.info("定时坐标已就绪 %s；到点直接点击，不等待截图或控件读取", target.center)
+        while now_ms() < on_sale_ms:
+            if self._stop_requested():
+                return GrabOutcome.CANCELLED
+            left_s = (on_sale_ms - now_ms()) / 1000
+            if left_s > 0.15:
+                time.sleep(min(0.05, left_s - 0.15))
+            # 最后 150ms 自旋等待（sleep 粒度 ~10ms，自旋到 ~1ms）
+        self._entered = True
+        return self._click_fixed_buy()
+
+    def _click_fixed_buy(self) -> Optional[str]:
+        if self._stop_requested():
+            return GrabOutcome.CANCELLED
+        if now_ms() >= self.deadline_ms:
+            return GrabOutcome.TIMEOUT
+        if self.dry_run:
+            log.info("[dry-run] 定时坐标已验证 %s，未点击", self._fixed_buy_bounds)
+            return "guard_verified"
+        left, top, right, bottom = self._fixed_buy_bounds
+        point = ((left + right) // 2, (top + bottom) // 2)
+        started = now_ms()
+        self._tap(*point)
+        ended = now_ms()
+        self._waiting_for_button = False
+        self._needs_backoff = False
+        self._buy_transition_until_ms = ended + _FIXED_BUY_TRANSITION_MS
+        self._unknown_after_buy = False
+        log.info("定时坐标点击 %s，距开票 %+dms 发出，ADB 点击 %dms（无截图、无元素等待）",
+                 point, started - self._sale_at_ms, ended - started)
+        return None
 
     def _run_until_end(self, on_sale_ms: int) -> str:
         probe_at_ms = on_sale_ms - _BUY_PROBE_LEAD_MS
@@ -312,11 +370,19 @@ class Grabber:
         if until_sale_ms > 0:
             time.sleep(min(0.15, until_sale_ms / 1000))
         else:
-            sleep_jitter(self.task.poll_interval_ms)
+            if self._fixed_buy_bounds:
+                time.sleep(0.01)
+            else:
+                sleep_jitter(self.task.poll_interval_ms)
 
     def _from_detail(self, probe_started_ms: int) -> Optional[str]:
         """详情页：优先识别可购文字，自绘按钮在底部购买栏内用视觉定位。"""
         self._waiting_for_button = True
+        if self._fixed_buy_bounds and now_ms() >= self._sale_at_ms:
+            # 首击后若仍在目标详情页，仅沿用本次预热坐标重试；不等截图。
+            bar = self.device.find_by_id("purchase_status_bar")
+            if bar and bar.bounds == self._fixed_buy_bounds:
+                return self._click_fixed_buy()
         buy = self.device.find(self.task.buy_texts)
         wait = buy is None and (
             self._sale_countdown_present()
@@ -385,10 +451,14 @@ class Grabber:
             except (AdbError, OSError, ValueError) as exc:
                 log.debug("原始截图不可用，回退 PNG: %s", exc)
         try:
-            bbox = self._find_button(self.adb.screencap_bytes())
-        except (AdbError, OSError, ValueError) as exc:
-            log.debug("视觉检测异常: %s", exc)
-            bbox = None
+            bbox = self._find_button(self.device.fast_screenshot())
+        except Exception as exc:  # noqa: BLE001 —— fast 失败再试 adb PNG
+            log.debug("fast 截图不可用，回退 adb PNG: %s", exc)
+            try:
+                bbox = self._find_button(self.adb.screencap_bytes())
+            except (AdbError, OSError, ValueError) as exc2:
+                log.debug("视觉检测异常: %s", exc2)
+                bbox = None
         return bbox, "PNG", now_ms() - start
 
     def _tier_pixels(self):
@@ -398,8 +468,12 @@ class Grabber:
                 return np.frombuffer(data, dtype=np.uint8).reshape(height, width, 4)
             except (AdbError, OSError, ValueError) as exc:
                 log.debug("选票原始帧不可用，改用 PNG: %s", exc)
-        with Image.open(io.BytesIO(self.adb.screencap_bytes())) as image:
-            return np.asarray(image.convert("RGB"))
+        try:
+            return np.asarray(self.device.fast_screenshot())
+        except Exception as exc:  # noqa: BLE001
+            log.debug("fast 截图不可用，回退 adb PNG: %s", exc)
+            with Image.open(io.BytesIO(self.adb.screencap_bytes())) as image:
+                return np.asarray(image.convert("RGB"))
 
     def _from_tier_sheet(self) -> Optional[str]:
         """使用预约选中项，直接点可用的「确定」。"""

@@ -175,6 +175,14 @@ class Device:
                 return node
         return None
 
+    def fast_screenshot(self):
+        """u2 atx-agent 截图（实测 ~170ms，比 adb exec-out 的 ~700ms 快 4 倍）。
+
+        返回 PIL.Image（RGB）；热路径专用，证据落盘仍用 Adb.screencap。
+        """
+        img = self._d.screenshot()
+        return img.convert("RGB") if img.mode != "RGB" else img
+
     def ime_text(self, text: str) -> bool:
         """向第一个输入框写入文字（uiautomator setText，支持中文，不走输入法）。"""
         sel = self._d(className="android.widget.EditText")
@@ -183,6 +191,11 @@ class Device:
         sel.set_text(text)
         self.refresh()
         return True
+
+    def set_field_text(self, resource_id: str, text: str) -> bool:
+        """通过设备 RPC 填写指定输入框。"""
+        field = self._d(resourceId=resource_id, className="android.widget.EditText")
+        return bool(field.set_text(text, timeout=2))
 
     # ---- 探测 ---------------------------------------------------------
 

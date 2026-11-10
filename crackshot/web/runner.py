@@ -76,7 +76,7 @@ class RunManager:
         self.evidence_root = db_path.parent / "evidence"
         self.recording_root = db_path.parent / "recordings" / db_path.name
         self._lock = threading.RLock()
-        self.device_busy: Dict[str, int] = {}     # serial → run_id
+        self.device_busy: Dict[str, Optional[int]] = {}  # serial → run_id，None 表示设备操作
         self.run_task: Dict[int, int] = {}        # run_id → task_id
         self.task_running: Set[int] = set()
         self.cancel_events: Dict[int, threading.Event] = {}  # run_id → event
@@ -118,7 +118,8 @@ class RunManager:
         out = []
         with self._lock:
             for serial, run_id in self.device_busy.items():
-                out.append({"serial": serial, "run_id": run_id})
+                if run_id is not None:
+                    out.append({"serial": serial, "run_id": run_id})
         return out
 
     def is_task_running(self, task_id: int) -> bool:
@@ -135,6 +136,22 @@ class RunManager:
             if task_id in self.task_running:
                 raise ValueError("任务运行中，不能修改")
             yield task
+
+    @contextmanager
+    def reserve_device(self, device_id: int):
+        with self._lock:
+            device = db.get_device(device_id)
+            if not device:
+                raise LookupError("设备不存在")
+            serial = device["serial"]
+            if serial in self.device_busy:
+                raise ValueError("设备正被其他运行或登录操作占用")
+            self.device_busy[serial] = None
+        try:
+            yield device
+        finally:
+            with self._lock:
+                self.device_busy.pop(serial, None)
 
     # ---- 调度 ----------------------------------------------------------
 
@@ -222,7 +239,10 @@ class RunManager:
         if not device or not device["enabled"]:
             raise ValueError("请绑定已启用的设备")
         if device["serial"] in self.device_busy:
-            raise ValueError(f"设备正在执行运行 #{self.device_busy[device['serial']]}")
+            run_id = self.device_busy[device["serial"]]
+            if run_id is None:
+                raise ValueError("设备正在处理登录配置或登录操作")
+            raise ValueError(f"设备正在执行运行 #{run_id}")
         return task, device
 
     def calibrate_task(self, task_id: int) -> int:
@@ -255,7 +275,7 @@ class RunManager:
             dev = Device(serial)
             task_cfg = db.task_config_from_row(task)
             if not navigate_to_detail(adb, dev, task_cfg):
-                raise RuntimeError("导航到详情页失败，请检查演出关键词/城市")
+                raise RuntimeError("导航到详情页失败，请查看前面的页面导航日志")
             page_time = read_page_sell_time(dev, task_cfg.city or None)
             if not is_target_detail(dev, task_cfg):
                 raise RuntimeError("读取时已离开目标演出详情页，请重新校准")

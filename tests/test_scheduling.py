@@ -10,10 +10,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from crackshot import grabber, navigator, scheduler
+from crackshot.login import LoginError, login_with_password
 from crackshot.device import Device, _parse_nodes
 from crackshot.config import TaskConfig
 from crackshot.timeutil import parse_local
-from crackshot.web import db, runner
+from crackshot.web import app as web_app, db, runner
 from crackshot.web.app import create_app
 from crackshot.reservation import ReservationUnavailable
 from crackshot.pages import PageState, recognize
@@ -92,6 +93,100 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(recognize(dev, self.task).state, PageState.TICKET_NOTICE)
         self.assertTrue(navigator.dismiss_ticket_notice(dev, SimpleNamespace(tap=lambda *xy: taps.append(xy))))
         self.assertEqual(taps, [(500, 1460)])
+
+    def test_search_switches_from_mine_to_verified_home(self):
+        scenes = [
+            node("我的订单", "tv_mine_order") + node("首页", "cn.damai:id/bottom_tab_item_tv")
+            + node(rid="pioneer_home_tab_container_1", bounds="[0,2200][220,2400]"),
+            node("演唱会", "bricks_ball_name")
+            + node(rid="cn.damai:id/homepage_header_search", bounds="[400,100][850,220]"),
+            node("搜索内容", "header_search_v2_input", clazz="android.widget.EditText"),
+        ]
+        taps = []
+        dev = device_with_xml(lambda: scenes[len(taps)])
+        adb = SimpleNamespace(is_damai_foreground=lambda: True, tap=lambda *xy: taps.append(xy))
+        with patch.object(navigator.time, "sleep", return_value=None), \
+             patch.object(navigator, "sleep_jitter", return_value=None):
+            self.assertFalse(navigator.open_search(dev, adb))
+            self.assertTrue(navigator._ensure_home(adb, dev))
+            self.assertTrue(navigator.open_search(dev, adb))
+        self.assertEqual(taps, [(110, 2300), (625, 160)])
+
+    def test_search_and_detail_match_official_title_with_quotes(self):
+        task = TaskConfig("test", "张杰1982开往未·LIVE", SALE, ["688"], city="南京")
+        official = "张杰1982开往「未·LIVE」巡回演唱会"
+        search = device_with_xml(lambda: node("搜索内容", "header_search_v2_input",
+                                               clazz="android.widget.EditText")
+                                 + node(official, "tv_word", "[100,240][1000,390]"))
+        fields, taps = [], []
+        search.set_field_text = lambda field, value: fields.append((field, value)) or True
+        adb = SimpleNamespace(tap=lambda *xy: taps.append(xy), back=lambda: None)
+        with patch.object(navigator, "sleep_jitter", return_value=None):
+            self.assertTrue(navigator.submit_search(search, adb, task))
+        self.assertEqual(fields, [("header_search_v2_input", task.show_name)])
+        self.assertEqual(taps, [(550, 315)])
+
+        for city, expected in (("南京", True), ("杭州", False)):
+            detail = device_with_xml(lambda: node(f"【{city}】{official}", "info_v2_title")
+                                     + node(rid="purchase_status_bar"))
+            self.assertEqual(navigator.is_target_detail(detail, task), expected)
+
+    def test_phone_login_selects_account_entry_and_stops_at_agreement(self):
+        scenes = [
+            node("演唱会", "bricks_ball_name") + node("我的", bounds="[900,2250][1080,2400]"),
+            node("我的订单", "tv_mine_order") + node("立即登录", bounds="[50,250][400,400]")
+            + node("登录后查看可用票", "mine_ticket_login_tip"),
+            node(rid="aliuser_main_content", children=node("手机淘宝登录", "login_third_tb_btn")
+                 + node(rid="login_third_account_btn", bounds="[90,2100][290,2250]")),
+            node("请您阅读并同意以下协议") + node("同意", "damai_dialog_confirm_btn"),
+        ]
+        taps = []
+        dev = device_with_xml(lambda: scenes[len(taps)])
+        adb = SimpleNamespace(is_damai_foreground=lambda: True, tap=lambda *xy: taps.append(xy))
+        with patch.object(navigator.time, "sleep", return_value=None):
+            self.assertEqual(navigator.open_phone_login(adb, dev),
+                             navigator.LoginState.CONSENT_REQUIRED)
+        self.assertEqual(taps, [(990, 2325), (225, 325), (190, 2175)])
+
+    def test_phone_login_preserves_existing_session(self):
+        dev = device_with_xml(lambda: node("我的订单", "tv_mine_order"))
+        adb = SimpleNamespace(is_damai_foreground=lambda: True)
+        with patch.object(navigator.time, "sleep", return_value=None):
+            self.assertEqual(navigator.open_phone_login(adb, dev), navigator.LoginState.SIGNED_IN)
+
+    def test_password_login_fills_configured_phone_after_switching_saved_account(self):
+        def control(name, label="", **kwargs):
+            return node(label, f"cn.damai:id/{name}", **kwargs)
+
+        consent = node("请您阅读并同意以下协议") + node("同意", "damai_dialog_confirm_btn")
+        account = "aliuser_login_account_et"
+        password = "aliuser_login_password_et"
+        stages = [
+            consent,
+            control("aliuser_register_sms_code_et", "请输入验证码")
+            + control("aliuser_login_switch_pwdlogin", "账号密码登录"),
+            control("aliuser_login_account_tv") + control(password)
+            + control("aliuser_menu_item_more"),
+            control("aliuser_menu_item", "换个账号登录"),
+            control(account) + control(password) + control("aliuser_login_login_btn", "登录"),
+        ]
+        for verified in (True, False):
+            with self.subTest(verified=verified):
+                last = node("我的订单", "tv_mine_order") if verified else node("请完成滑块验证")
+                taps, fields = [], []
+                dev = device_with_xml(lambda: (stages + [last])[len(taps)])
+                dev.set_field_text = lambda field, value: fields.append((field, value)) or True
+                adb = SimpleNamespace(is_damai_foreground=lambda: True,
+                                      tap=lambda *xy: taps.append(xy))
+                with patch.object(navigator.time, "sleep", return_value=None):
+                    if verified:
+                        self.assertTrue(login_with_password(adb, dev, "10000000000", "fixture"))
+                    else:
+                        with self.assertRaisesRegex(LoginError, "安全验证"):
+                            login_with_password(adb, dev, "10000000000", "fixture")
+                self.assertEqual(fields, [(f"cn.damai:id/{account}", "10000000000"),
+                                          (f"cn.damai:id/{password}", "fixture")])
+                self.assertEqual(len(taps), len(stages))
 
     def test_native_confirm_requires_exact_selected_tier_and_consistent_total(self):
         task = TaskConfig("test", SHOW, SALE, ["480"], city="杭州", session="2027-01-09 19:30")
@@ -201,6 +296,7 @@ class SchedulingTests(unittest.TestCase):
                 messages.append(message)
             await self.app({"type": "http", "asgi": {"version": "3.0"}, "method": method,
                             "path": path, "headers": [(b"content-type", b"application/json"), *headers],
+                            "client": ("127.0.0.1", 50000), "server": ("127.0.0.1", 8780),
                             "query_string": b"", "scheme": "http", "root_path": "",
                             "http_version": "1.1"}, receive, send)
             payload = b"".join(m.get("body", b"") for m in messages)
@@ -209,6 +305,46 @@ class SchedulingTests(unittest.TestCase):
             self.assertEqual(messages[0]["status"], expected, payload)
             return payload
         return asyncio.run(call())
+
+    def test_device_login_is_local_and_uses_credentials_only_on_the_selected_device(self):
+        path = f"/api/devices/{self.device_id}/login"
+        saved = {}
+
+        def save(_store, device, phone, password):
+            saved[device["serial"]] = (phone, password)
+
+        def read(_store, device):
+            return saved.get(device["serial"])
+
+        def delete(_store, device):
+            saved.pop(device["serial"], None)
+
+        def perform(adb, _device, phone, password):
+            with self.assertRaises(ValueError):
+                with self.manager.reserve_device(self.device_id):
+                    self.fail("登录时不应能再次占用同一设备")
+            return (adb.serial, phone, password) == ("fake-phone", "10000000000", "fixture")
+
+        with patch.object(web_app.DeviceCredentials, "save", save), \
+             patch.object(web_app.DeviceCredentials, "read", read), \
+             patch.object(web_app.DeviceCredentials, "delete", delete), \
+             patch.object(web_app, "find_adb", return_value="fake-adb"), \
+             patch.object(web_app, "Adb") as adb, \
+             patch.object(web_app, "Device"), \
+             patch.object(web_app, "login_with_password", side_effect=perform) as login:
+            adb.list_devices.return_value = [{"id": "fake-phone", "state": "device"}]
+            adb.return_value.serial = "fake-phone"
+            self.request("PUT", path, {"phone": "10000000000", "password": "fixture"}, 403,
+                         headers=((b"origin", b"https://other.example"),))
+            self.assertEqual(saved, {})
+            self.request("PUT", path, {"phone": "10000000000", "password": "fixture"})
+            self.assertEqual(self.request("GET", path), {"configured": True, "phone_tail": "0000"})
+            self.assertEqual(self.request("POST", path), {"status": "signed_in"})
+            adb.assert_called_once_with("fake-adb", "fake-phone")
+            login.assert_called_once()
+            self.assertEqual(self.manager.device_busy, {})
+            self.request("DELETE", path)
+            self.assertEqual(self.request("GET", path), {"configured": False, "phone_tail": ""})
 
     def wait_run(self, tid):
         deadline = time.monotonic() + 3

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import logging
 import time
+from enum import Enum
 from typing import Optional
+from unicodedata import normalize
 
 from .adb import Adb, AdbError, DAMAI_LAUNCH_ACTIVITY
 from .config import TaskConfig
@@ -22,6 +24,12 @@ log = logging.getLogger("crackshot.navigator")
 
 # 每步之间的基础等待（页面过渡），再叠加随机抖动
 _STEP_SLEEP = (0.8, 1.5)
+
+
+class LoginState(Enum):
+    SIGNED_IN = "signed_in"
+    CONSENT_REQUIRED = "consent_required"
+    PHONE_FORM = "phone_form"
 
 
 def _snapshot_retry(device: Device, tries: int = 3) -> None:
@@ -55,35 +63,119 @@ def _bring_foreground(adb: Adb, timeout: float = 12.0) -> bool:
 
 
 def _at_home(device: Device) -> bool:
-    """首页特征：分类球（bricks_ball_name）或底部「首页」tab。"""
-    if device.find_by_id("bricks_ball_name"):
-        return True
-    return device.find(["首页"]) is not None
+    """用首页内容确认页面，底栏在「我的」等页面也会显示。"""
+    return any(device.find_by_id(hint) for hint in (
+        "bricks_ball_name", "homepage_header_search", "pioneer_homepage_header_search_btn",
+    ))
 
 
 def _ensure_home(adb: Adb, device: Device) -> bool:
-    """确保在大麦首页：不在首页就 back 逐层返回，出现首页特征即停。"""
+    """优先通过底栏切回首页，其他页面逐层返回。"""
+    switched_tab = False
     for _ in range(5):
         _snapshot_retry(device)
-        if _at_home(device):
-            return True
         if not adb.is_damai_foreground():
             # back 退出过头了，重新拉起
             if not _bring_foreground(adb):
                 return False
             continue
+        if _at_home(device):
+            return True
+        if device.find_by_id("aliuser_main_content") or _login_agreement(device):
+            log.warning("大麦停在登录流程，请先完成登录")
+            return False
+        if switched_tab:
+            time.sleep(0.5)
+            continue
+        home_tab = device.find_by_id("pioneer_home_tab_container_1")
+        if not home_tab:
+            home_tab = next((node for node in device.find_all(["首页"])
+                             if node.resource_id.endswith("/bottom_tab_item_tv")), None)
+        if home_tab and home_tab.enabled:
+            adb.tap(*home_tab.center)
+            switched_tab = True
+            log.info("切换底栏「首页」，等待首页内容加载")
+            time.sleep(0.5)
+            continue
         adb.back()
         sleep_jitter((0.8, 1.4))
     _snapshot_retry(device)
-    return _at_home(device)
+    return adb.is_damai_foreground() and _at_home(device)
+
+
+def _login_agreement(device: Device) -> bool:
+    return (device.find_by_id("damai_dialog_confirm_btn") is not None
+            and device.find_contains("请您阅读并同意以下协议") is not None)
+
+
+def _phone_login_form(device: Device) -> bool:
+    return any(device.find_by_id(f"cn.damai:id/{name}") for name in (
+        "aliuser_login_switch_pwdlogin", "aliuser_login_password_et",
+        "aliuser_register_sms_code_et",
+    )) or device.find(["换个账号登录"]) is not None
+
+
+def _signed_in_profile(device: Device) -> bool:
+    return bool(device.find_by_id("tv_mine_order") and not device.find(["立即登录"])
+                and not device.find_by_id("mine_ticket_login_tip"))
+
+
+def open_phone_login(adb: Adb, device: Device, *, accept_agreement: bool = False) -> LoginState:
+    """检查「我的」页，未登录时打开手机号入口。"""
+    if not adb.is_damai_foreground() and not _bring_foreground(adb):
+        raise AdbError("未能打开大麦")
+    _snapshot_retry(device)
+    if not (device.find_by_id("tv_mine_order") or device.find_by_id("aliuser_main_content")
+            or _login_agreement(device) or _phone_login_form(device)):
+        if not _ensure_home(adb, device):
+            raise AdbError("未找到大麦首页")
+        mine = device.find(["我的"])
+        if not mine or not mine.enabled:
+            raise AdbError("未找到大麦「我的」入口")
+        adb.tap(*mine.center)
+
+    opened_login = opened_phone = accepted_agreement = profile_loaded = False
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and adb.is_damai_foreground():
+        device.refresh()
+        if _login_agreement(device):
+            if not accept_agreement:
+                return LoginState.CONSENT_REQUIRED
+            confirm = device.find_by_id("damai_dialog_confirm_btn")
+            if confirm and not accepted_agreement and confirm.enabled and _label(confirm) == "同意":
+                adb.tap(*confirm.center)
+                accepted_agreement = True
+        elif _phone_login_form(device):
+            return LoginState.PHONE_FORM
+        elif device.find_by_id("aliuser_main_content"):
+            phone = device.find_by_id("login_third_account_btn")
+            if phone and phone.enabled and not opened_phone:
+                adb.tap(*phone.center)
+                opened_phone = True
+        elif device.find_by_id("tv_mine_order"):
+            entry = device.find(["立即登录"])
+            if entry and entry.enabled and not opened_login:
+                adb.tap(*entry.center)
+                opened_login = True
+            signed_in = _signed_in_profile(device)
+            if signed_in and profile_loaded and not opened_login:
+                return LoginState.SIGNED_IN
+            profile_loaded = signed_in
+        else:
+            profile_loaded = False
+        time.sleep(0.4)
+    raise AdbError("未能确认登录状态或打开手机号登录页")
+
+
+def _search_input(device: Device) -> Optional[Element]:
+    return next((node for node in device.find_all_by_id("header_search_v2")
+                 if node.clazz.endswith("EditText") and node.enabled), None)
 
 
 def open_search(device: Device, adb: Adb) -> bool:
     """从大麦首页打开搜索页。
 
-    首页顶栏节点在 uiautomator dump 中偶发缺失（自绘 header），找不到
-    '搜索' 节点时按相对坐标点搜索胶囊（顶栏 y≈6.6% 屏高，胶囊 x≈47%
-    宽、按钮 x≈88% 宽，真机 1176x2400 验证），以 EditText 出现为成功判据。
+    首页顶栏为自绘控件，确认首页后才能使用相对坐标兜底。
     """
     from PIL import Image
     import io as _io
@@ -93,27 +185,31 @@ def open_search(device: Device, adb: Adb) -> bool:
             png = adb.screencap_bytes()
             w, h = Image.open(_io.BytesIO(png)).size
         except Exception:  # noqa: BLE001 —— 截图失败用常见分辨率兜底
-            w, h = 1176, 2400
+            return False
         adb.tap(int(w * 0.47), int(h * 0.066))
+        return True
 
     for attempt in range(3):
         _snapshot_retry(device)
-        entry = None
-        for node in device.dump_clickables(limit=60):
-            if node.text == "搜索" and node.clickable:
-                entry = node
-                break
+        if _search_input(device):
+            return True
+        if not adb.is_damai_foreground() or not _at_home(device):
+            return False
+        entry = next((node for node in device.elements()
+                      if node.enabled and (node.resource_id.endswith("/homepage_header_search")
+                                           or (_label(node) == "搜索" and node.clickable))), None)
         if entry:
             adb.tap(*entry.center)
         else:
             log.info("dump 未见搜索节点（第 %s 次），按相对坐标点搜索胶囊", attempt + 1)
-            _tap_search_bar()
+            if not _tap_search_bar():
+                return False
         # 搜索页加载有延迟，多次重试确认 EditText 再下结论（过早 back 会把
         # 刚打开的搜索页关掉，之前三次循环全部因此作废）
         for _ in range(4):
             sleep_jitter(_STEP_SLEEP)
             device.refresh()
-            if device.find_by_class("EditText"):
+            if _search_input(device):
                 return True
         if not _ensure_home(adb, device):
             return False
@@ -122,7 +218,8 @@ def open_search(device: Device, adb: Adb) -> bool:
 
 def submit_search(device: Device, adb: Adb, task: TaskConfig) -> bool:
     """写入关键词并触发搜索：优先点联想词（官方完整演出名），否则回车。"""
-    if not device.ime_text(task.show_name):
+    field = _search_input(device)
+    if not field or not device.set_field_text(field.resource_id, task.show_name):
         log.warning("未找到搜索输入框")
         return False
     sleep_jitter((0.4, 0.9))
@@ -133,11 +230,12 @@ def submit_search(device: Device, adb: Adb, task: TaskConfig) -> bool:
     # 优先 含演出名+城市 > 含演出名的长词（官方完整演出名）
     suggestion = None
     fallback = None
+    show = _show_key(task.show_name)
     for node in device.dump_clickables(limit=40):
-        text = node.text
-        if not text or text.strip() == task.show_name:
+        text = _label(node)
+        if node.clazz.endswith("EditText") or text.strip() == task.show_name:
             continue
-        if task.show_name in text:
+        if show and show in _show_key(text):
             if task.city and task.city in text:
                 suggestion = node
                 break
@@ -156,6 +254,10 @@ def submit_search(device: Device, adb: Adb, task: TaskConfig) -> bool:
 
 def _label(node: Element) -> str:
     return node.text or node.description
+
+
+def _show_key(text: str) -> str:
+    return "".join(ch for ch in normalize("NFKC", text).casefold() if ch.isalnum())
 
 
 def _inside(child: Element, ancestor: Element) -> bool:
@@ -177,7 +279,8 @@ def _search_result(nodes, task: TaskConfig) -> Optional[Element]:
     visible = [n for n in nodes if n.enabled and _label(n)
                and n.center[1] > max(header, height * 0.10)
                and not n.clazz.endswith("EditText")]
-    titles = [n for n in visible if task.show_name in _label(n)
+    show = _show_key(task.show_name)
+    titles = [n for n in visible if show and show in _show_key(_label(n))
               and (_label(n).strip() != task.show_name
                    or n.clickable or "title" in n.resource_id)]
     if not task.city:
@@ -246,10 +349,13 @@ def is_target_detail(device: Device, task: TaskConfig, snap: Optional[PageSnapsh
     if device.find_by_id("header_search_v2") is not None:
         return False
     title = next((n for n in device.find_all_by_id("info_v2_title") if _label(n)), None)
+    show = _show_key(task.show_name)
+    if not show:
+        return False
     if title:
-        if task.show_name not in _label(title):
+        if show not in _show_key(_label(title)):
             return False
-    elif not device.exists_contains_any([task.show_name]):
+    elif not any(show in _show_key(_label(n)) for n in device.elements()):
         return False
     if not task.city:
         return True
@@ -316,7 +422,8 @@ def navigate_to_detail(adb: Adb, device: Device, task: TaskConfig,
 
     if stopped():
         return False
-    if _is_tour(device) and device.exists_contains_any([task.show_name]):
+    show = _show_key(task.show_name)
+    if _is_tour(device) and show and any(show in _show_key(_label(n)) for n in device.elements()):
         _enter_city_card(device, adb, task)
         dismiss_ticket_notice(device, adb)
         if is_target_detail(device, task):

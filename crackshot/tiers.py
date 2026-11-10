@@ -113,22 +113,19 @@ def _target(cards, screen, read_label, matches):
     return (candidates[0], False) if len(candidates) == 1 else (None, False)
 
 
-def _active_confirm(node, screen):
-    crop = _crop(screen(), node.bounds)
-    if not crop.size or not node.enabled:
-        return False
-    r, g, b = (crop[..., i] for i in range(3))
-    return ((r >= 230) & (g < .62 * r) & (b < .34 * r)).mean() >= .20
-
-
 def _read_confirm(nodes, bottom, capture) -> Selection:
     if bottom is None or not bottom.enabled:
         return Selection("wait", reason="选票页底栏未就绪")
     controls = [n for n in nodes if _under(n, bottom)]
+    # 大麦的自绘按钮始终 enabled=true；未选好票时以遮罩禁用，不能只看 enabled。
+    if any(_id(n) == "view_translucent" for n in controls):
+        return Selection("wait", reason="确定按钮仍被禁用遮罩覆盖")
     confirm = next((n for n in controls if _label(n) == "确定"), None)
     if confirm is None:
         button = next((n for n in controls if _id(n) == "btn_buy_view" and n.enabled), None)
-        if button and _active_confirm(button, capture):
+        total = next((_label(n).replace(",", "") for n in controls if _id(n) == "tv_price"), "")
+        # 合计和禁用遮罩均在当前控件树中，不再截图检查按钮颜色。
+        if button and re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", total) and float(total) > 0:
             confirm = button
     if confirm and confirm.enabled:
         return Selection("confirm", confirm.center)
