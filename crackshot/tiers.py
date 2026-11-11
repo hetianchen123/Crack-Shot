@@ -113,7 +113,7 @@ def _target(cards, screen, read_label, matches):
     return (candidates[0], False) if len(candidates) == 1 else (None, False)
 
 
-def _read_confirm(nodes, bottom, capture) -> Selection:
+def _read_confirm(nodes, bottom) -> Selection:
     if bottom is None or not bottom.enabled:
         return Selection("wait", reason="选票页底栏未就绪")
     controls = [n for n in nodes if _under(n, bottom)]
@@ -122,19 +122,16 @@ def _read_confirm(nodes, bottom, capture) -> Selection:
         return Selection("wait", reason="确定按钮仍被禁用遮罩覆盖")
     confirm = next((n for n in controls if _label(n) == "确定"), None)
     if confirm is None:
-        button = next((n for n in controls if _id(n) == "btn_buy_view" and n.enabled), None)
-        total = next((_label(n).replace(",", "") for n in controls if _id(n) == "tv_price"), "")
-        # 合计和禁用遮罩均在当前控件树中，不再截图检查按钮颜色。
-        if button and re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", total) and float(total) > 0:
-            confirm = button
+        confirm = next((n for n in controls if _id(n) == "btn_buy_view" and n.enabled), None)
     if confirm and confirm.enabled:
         return Selection("confirm", confirm.center)
     return Selection("wait", reason="确定按钮暂不可用")
 
 
-def read_confirm(nodes, capture, _task) -> Selection:
-    """仅定位选票页可用的确认按钮，使用页面已有的预约选中项。"""
-    return _read_confirm(nodes, next((n for n in nodes if _id(n) == _BOTTOM), None), capture)
+def read_confirm(nodes, _capture, _task) -> Selection:
+    """沿用预约选中项，只定位可用的确定按钮。"""
+    bottom = next((n for n in nodes if _id(n) == _BOTTOM), None)
+    return _read_confirm(nodes, bottom)
 
 
 def read_selection(nodes, capture, task) -> Selection:
@@ -155,9 +152,11 @@ def read_selection(nodes, capture, task) -> Selection:
         return next(iter(by_id.get(rid, ())), None)
 
     title = first("title_tv")
-    if title and _label(title) and (task.show_name not in _label(title)
-                                     or (task.city and task.city not in _label(title))):
-        return Selection("blocked", reason="选票页演出或城市不符")
+    if title and _label(title):
+        from .navigator import _show_key
+        if (_show_key(task.show_name) not in _show_key(_label(title))
+                or (task.city and task.city not in _label(title))):
+            return Selection("blocked", reason="选票页演出或城市不符")
 
     def cards(rid):
         container = first(rid)
@@ -173,7 +172,7 @@ def read_selection(nodes, capture, task) -> Selection:
         if not selected:
             return Selection("session", session.node.center) if session.node.enabled else Selection("wait")
 
-    price_text = task.price_tiers[0]
+    price_text = task.price_tiers[0] if len(task.price_tiers) == 1 else ""
     if not re.fullmatch(r"[0-9]+", price_text) or int(price_text) <= 0:
         return Selection("blocked", reason="任务的目标票档金额无效")
     wanted = int(price_text)
@@ -195,7 +194,7 @@ def read_selection(nodes, capture, task) -> Selection:
     total = int(amount.split(".")[0])
     if total <= 0 or total % wanted:
         return Selection("wait", reason=f"订单合计 ¥{total} 与票档 ¥{wanted} 无法核对")
-    confirm = _read_confirm(nodes, bottom, screen)
+    confirm = _read_confirm(nodes, bottom)
     if confirm.action == "confirm":
         return Selection("confirm", confirm.point, quantity=total // wanted)
     return confirm

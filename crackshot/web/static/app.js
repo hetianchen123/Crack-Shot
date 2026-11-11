@@ -74,16 +74,23 @@ function esc(s) {
 function badge(kind, text) {
   return `<span class="badge ${kind}">${esc(text)}</span>`;
 }
-function countdown(onSaleAt) {
-  const ms = new Date(onSaleAt.replace(" ", "T") + "+08:00").getTime() - Date.now();
-  if (!Number.isFinite(ms)) return "";
+function countdown(ms) {
   if (ms <= 0) return "已到点";
-  const s = Math.floor(ms / 1000);
+  const s = Math.ceil(ms / 1000);
   const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600),
     m = Math.floor((s % 3600) / 60), sec = s % 60;
   if (d) return `${d}天${h}时`;
   if (h) return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
   return `${m}:${String(sec).padStart(2, "0")}`;
+}
+
+let overviewClock;
+function updateCountdowns() {
+  if (!overviewClock) return;
+  const now = overviewClock.serverMs + performance.now() - overviewClock.receivedAt;
+  document.querySelectorAll("#ov-next [data-trigger-ms]").forEach((cell) => {
+    cell.textContent = countdown(Number(cell.dataset.triggerMs) - now);
+  });
 }
 
 /* ---------- 导航 ---------- */
@@ -102,6 +109,7 @@ document.querySelectorAll("#nav button").forEach((btn) => {
 
 async function renderOverview() {
   const data = await api.get("/api/overview");
+  overviewClock = {serverMs: data.server_now_ms, receivedAt: performance.now()};
   devicesCache = data.devices;
   const tasks = data.tasks;
   const counts = { enabled: 0, scheduled: 0, running: 0, success: 0, attention: 0 };
@@ -125,10 +133,11 @@ async function renderOverview() {
       <td>${esc(t.name)}</td><td>${esc(t.show_name)}</td>
       <td>${esc(t.device_serial || "未绑定")}${t.account_label ? ` / ${esc(t.account_label)}` : ""}</td>
       <td class="mono">${esc(t.on_sale_at)}</td>
-      <td class="mono">${countdown(t.on_sale_at)}</td>
+      <td class="mono"${Number.isFinite(t.trigger_at_ms) ? ` data-trigger-ms="${t.trigger_at_ms}"` : ""}></td>
       <td>${badge(t.status, t.scheduled_dry_run && t.status === "scheduled"
         ? "定时演练已排程" : STATUS_LABEL[t.status] || t.status)}</td>
     </tr>`).join("")}</table>` : `<div class="empty">没有待开票任务</div>`;
+  updateCountdowns();
 
   $("#ov-runs").innerHTML = data.runs.length ? `<table>
     <tr><th>#</th><th>任务</th><th>开始</th><th>结果</th><th>尝试</th><th></th></tr>
@@ -336,14 +345,14 @@ function openSchedule(id, dryRun) {
   const updating = scheduleMode(task) === (dryRun ? "rehearsal" : "formal");
   const testTime = new Date(Date.now() + (prewarm + 1) * 60000 + 8 * 3600000)
     .toISOString().slice(0, 19).replace("T", " ");
-  form.on_sale_at.value = updating ? task.on_sale_at :
-    (dryRun ? testTime : (task.calibrated_at || task.on_sale_at));
+  form.on_sale_at.readOnly = !dryRun;
+  form.on_sale_at.value = dryRun ? (updating ? task.on_sale_at : testTime) : task.calibrated_at;
   const title = dryRun ? (updating ? "修改定时演练" : "建立定时演练") :
     (updating ? "修改正式排程" : "确认开抢时间");
   $("#schedule-title").textContent = `${title} · ${task.name}`;
   form.querySelector("[type=submit]").textContent = updating ? "保存排程修改" : "建立定时任务";
   $("#schedule-description").textContent = dryRun
-    ? `提前 ${prewarm} 分钟进入目标页守护，到演练时间核对页面，不点击购买按钮。`
+    ? `提前 ${prewarm} 分钟预热，到点记录首击坐标和时间，跳过实际点击。`
     : `目标演出 ${task.calibration?.target_date || task.session}，票档 ${priceList(task)}。提前 ${prewarm} 分钟预热。页面开票时间 ${task.calibrated_at}。`;
   $("#schedule-error").textContent = "";
   $("#schedule-dialog").showModal();
@@ -754,6 +763,7 @@ async function refreshAll() {
   }
 }
 
+setInterval(updateCountdowns, 250);
 setInterval(() => {
   $("#clock").textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
 }, 1000);

@@ -1,7 +1,7 @@
 """在控件树读取的同时预取开票画面。"""
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 
 from . import vision
@@ -35,20 +35,23 @@ class OpeningProbe:
             return self._read()
         return None
 
-    def result(self, bar):
+    @property
+    def ready(self) -> bool:
+        return self.before.done() and self.after.done()
+
+    def result(self, bar, *, observed_at_ms=None):
         """只接受到点后捕获、仍新鲜且按钮文案确有变化的画面。"""
-        if not self.before.done():
+        if not self.ready:
             return None
         before = self.before.result()
         if not before or before[1] >= self.sale_at_ms or not self._inside_bar(before[2], bar):
             return None
-        try:
-            after = self.after.result(timeout=2.1)
-        except TimeoutError:
-            return None
+        after = self.after.result()
         if not after:
             return None
         start, end, bbox, glyphs = after
+        if observed_at_ms is not None and observed_at_ms < end:
+            return None
         if (start < self.sale_at_ms or now_ms() - end > 350 or not self._inside_bar(bbox, bar)
                 or not vision.button_text_changed(before[3], glyphs)):
             return None

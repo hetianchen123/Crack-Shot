@@ -69,7 +69,8 @@ def create_app(db_path: Path) -> FastAPI:
     def overview() -> Dict[str, Any]:
         tasks = db.list_tasks()
         online = manager.scan_devices()
-        busy = {item["serial"]: item["run_id"] for item in manager.running_view()}
+        running = manager.running_view()
+        busy = {item["serial"]: item["run_id"] for item in running}
         devices = []
         for d in db.list_devices():
             run_id = busy.get(d["serial"])
@@ -85,9 +86,15 @@ def create_app(db_path: Path) -> FastAPI:
             for s, m in online.items() if s not in {d["serial"] for d in devices}
         ]
         settings = db.get_settings()
-        now_next = sorted(
-            (t for t in tasks if t["enabled"] and t["status"] in SCHEDULED_STATUSES),
-            key=lambda t: t["on_sale_at"])
+        active_times = {r["task_id"]: r["trigger_at_ms"] for r in running
+                        if r["trigger_at_ms"] is not None}
+        now_next = []
+        for task in tasks:
+            if task["id"] in active_times:
+                now_next.append({**task, "trigger_at_ms": active_times[task["id"]]})
+            elif task["enabled"] and task["status"] in SCHEDULED_STATUSES:
+                now_next.append(_with_schedule(task, settings))
+        now_next.sort(key=lambda t: t["trigger_at_ms"] or float("inf"))
         return {
             "tasks": tasks,
             "devices": devices,
@@ -98,6 +105,7 @@ def create_app(db_path: Path) -> FastAPI:
                 {"run_id": rid, "serial": s} for s, rid in busy.items()],
             "settings": settings,
             "extractor": extractor.status(settings["ollama_url"], settings["vlm_model"]),
+            "server_now_ms": now_ms(),
         }
 
     # ---- 账号 ----------------------------------------------------------
@@ -521,11 +529,11 @@ def _with_schedule(task: dict, settings: dict) -> dict:
         "prewarm_minutes", settings.get("default_prewarm_minutes", "5")))}
     if task["status"] in SCHEDULED_STATUSES:
         try:
-            _, due, _ = schedule_times(task, settings)
-            return {**task, "prewarm_at": format_time(due)}
+            trigger, due, _ = schedule_times(task, settings)
+            return {**task, "prewarm_at": format_time(due), "trigger_at_ms": trigger}
         except ValueError:
             pass
-    return {**task, "prewarm_at": None}
+    return {**task, "prewarm_at": None, "trigger_at_ms": None}
 
 
 def _options_to_fields(options: Dict[str, Any]) -> Dict[str, Any]:

@@ -59,7 +59,6 @@ class TaskRunner:
         dry_run: bool = False,
         stop_check=None,
         phase_cb=None,
-        guard_only: bool = False,
         recording_path: Optional[Path] = None,
     ):
         self.cfg = cfg
@@ -70,7 +69,6 @@ class TaskRunner:
         self.dry_run = dry_run
         self.stop_check = stop_check
         self.phase_cb = phase_cb
-        self.guard_only = guard_only
         self.recording_path = recording_path
         self.grabber = Grabber(adb, device, task, notifier, evidence_root,
                                dry_run, stop_check=stop_check)
@@ -174,13 +172,6 @@ class TaskRunner:
         if not on_page:
             self.notifier.critical("到达开票准备时刻，仍未确认目标详情页")
             return GrabOutcome.NEEDS_HUMAN
-        if self.guard_only:
-            if sleep_until(on_sale_ms, "演练触发", self.stop_check):
-                return GrabOutcome.CANCELLED
-            if not self._page_guard():
-                return GrabOutcome.NEEDS_HUMAN
-            log.info("定时演练通过：到达开抢时刻，已确认目标详情页（无购买点击）")
-            return "guard_verified"
         log.info("到达紧轮询时点，交给抢票状态机；开票前禁止点击")
         self._phase("grabbing")
         return self.grabber.run(on_sale_ms, verify_detail=True)
@@ -213,44 +204,70 @@ def read_page_sell_time(device, city: Optional[str] = None) -> Optional[int]:
 
     支持格式：「X月X日 XX:XX开抢」「今天/明天 XX:XX开抢」（真机实测
     多城巡演城市卡片显示"宁波站 今天12:00开抢"）。多城巡演时优先取
-    包含目标城市名的节点；读不到返回 None。
+    属于目标城市的文案或单站主倒计时；歧义时返回 None。
     """
     import re
-    from .navigator import _snapshot_retry
+    from .navigator import _inside, _is_tour, _snapshot_retry
 
-    now = datetime.fromtimestamp(now_ms() / 1000, LOCAL_TZ)
     for _ in range(2):
         _snapshot_retry(device)
         if recognize(device, _GUARD_TASK).state != PageState.DETAIL:
             return None
+        now = datetime.fromtimestamp(now_ms() / 1000, LOCAL_TZ)
         nodes = device.elements()
+        tour = _is_tour(device)
         labels = [n for n in nodes if "开抢" in (n.text or n.description)
                   or "开售" in (n.text or n.description)
                   or "count_sell_time" in n.resource_id]
-        labels.sort(key=lambda n: (not city or city not in (n.text or n.description),
-                                   "count_sell_time" not in n.resource_id))
+        target_times, detail_times = set(), set()
         for node in labels:
             text = node.text or node.description
-            hh_mm = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", text)
+            # 城市卡片里的倒计时有时与城市名分别放在两个子节点中。
+            parent = node
+            while parent and "city_card" not in parent.resource_id:
+                parent = parent.parent
+            city_label = re.match(r"^\s*([^\s\d，。]+?)(?:站|市)(?=\s|\d|今天|今日|明天|明日)", text)
+            scopes = {city_label[1]} if city_label else set()
+            if parent:
+                scopes.update((item.text or item.description).strip().rstrip("站市")
+                              for item in nodes if "tour_city_name" in item.resource_id
+                              and _inside(item, parent) and (item.text or item.description).strip())
+            if len(scopes) > 1 or (city and scopes and city.rstrip("站市") not in scopes):
+                continue
+            if (tour or parent) and not scopes:
+                continue
+            clock_pattern = r"(\d{1,2}):(\d{2})(?::(\d{2}))?"
+            hh_mm = re.search(clock_pattern + r"\s*开[抢售]", text)
+            if not hh_mm:
+                clocks = list(re.finditer(clock_pattern, text))
+                hh_mm = clocks[0] if len(clocks) == 1 else None
             if not hh_mm:
                 continue
             hh, mi, ss = (int(part or 0) for part in hh_mm.groups())
-            md = re.search(r"(?:(\d{4})年)?(\d{1,2})月(\d{1,2})日", text)
+            prefix = text[:hh_mm.start()]
+            dates = list(re.finditer(r"(?:(\d{4})年)?(\d{1,2})月(\d{1,2})日|今天|今日|明天|明日", prefix))
+            if not dates:
+                continue
+            date = dates[-1]
             try:
-                if md:
-                    year, mon, day = md.groups()
+                if date[2]:
+                    year, mon, day = date.groups()
                     candidate = datetime(int(year or now.year), int(mon), int(day),
                                          hh, mi, ss, tzinfo=LOCAL_TZ)
                     if not year and candidate < now - timedelta(days=90):
                         candidate = candidate.replace(year=now.year + 1)
-                elif any(word in text for word in ("今天", "今日", "明天", "明日")):
-                    base = now + timedelta(days=int("明天" in text or "明日" in text))
-                    candidate = base.replace(hour=hh, minute=mi, second=ss, microsecond=0)
                 else:
-                    continue
-                return epoch_ms(candidate)
+                    base = now + timedelta(days=int(date[0] in ("明天", "明日")))
+                    candidate = base.replace(hour=hh, minute=mi, second=ss, microsecond=0)
+                (target_times if scopes and city else detail_times).add(epoch_ms(candidate))
             except ValueError:
                 continue
+        candidates = target_times or detail_times
+        if len(candidates) == 1:
+            return candidates.pop()
+        if len(candidates) > 1:
+            log.warning("目标开售时间存在多个候选，无法校准")
+            return None
         time.sleep(0.5)
     return None
 

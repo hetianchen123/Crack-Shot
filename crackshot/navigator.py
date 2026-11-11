@@ -69,11 +69,17 @@ def _at_home(device: Device) -> bool:
     ))
 
 
-def _ensure_home(adb: Adb, device: Device) -> bool:
+def _ensure_home(adb: Adb, device: Device, *, task: Optional[TaskConfig] = None,
+                 stop_check=None) -> bool:
     """优先通过底栏切回首页，其他页面逐层返回。"""
     switched_tab = False
+    tapped_order_exit = False
     for _ in range(5):
+        if stop_check and stop_check():
+            return False
         _snapshot_retry(device)
+        if stop_check and stop_check():
+            return False
         if not adb.is_damai_foreground():
             # back 退出过头了，重新拉起
             if not _bring_foreground(adb):
@@ -84,6 +90,22 @@ def _ensure_home(adb: Adb, device: Device) -> bool:
         if device.find_by_id("aliuser_main_content") or _login_agreement(device):
             log.warning("大麦停在登录流程，请先完成登录")
             return False
+        if task is not None:
+            state = recognize(device, task).state
+            if state == PageState.CAPTCHA:
+                log.warning("回首页时遇到安全验证，请人工处理")
+                return False
+            if state in (PageState.ORDER_RETRY, PageState.ORDER_REVIEW, PageState.ORDER_SOLD_OUT):
+                leave = device.find(["返回重新选购"])
+                if leave:
+                    # 旧订单弹窗会吞掉系统返回键，使用弹窗自己的退出按钮。
+                    if leave.enabled and not tapped_order_exit:
+                        adb.tap(*leave.center)
+                        tapped_order_exit = True
+                        log.info("退出上一场订单弹窗：「返回重新选购」")
+                    time.sleep(0.5)
+                    continue
+            tapped_order_exit = False
         if switched_tab:
             time.sleep(0.5)
             continue
@@ -361,8 +383,7 @@ def is_target_detail(device: Device, task: TaskConfig, snap: Optional[PageSnapsh
         return True
     return (bool(title and task.city in _label(title))
             or any(task.city in _label(n) for n in device.elements()
-                   if any(hint in n.resource_id for hint in ("venue_name", "venue_address",
-                                                              "count_sell_time"))))
+                   if any(hint in n.resource_id for hint in ("venue_name", "venue_address"))))
 
 
 def dismiss_ticket_notice(device: Device, adb: Adb) -> bool:
@@ -429,7 +450,7 @@ def navigate_to_detail(adb: Adb, device: Device, task: TaskConfig,
         if is_target_detail(device, task):
             return True
 
-    if stopped() or not _ensure_home(adb, device):
+    if stopped() or not _ensure_home(adb, device, task=task, stop_check=stopped):
         log.warning("未能回到大麦首页")
         return False
     if stopped() or not open_search(device, adb):

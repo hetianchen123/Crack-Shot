@@ -27,6 +27,12 @@ class OpeningProbeTests(unittest.TestCase):
     def test_fresh_changed_frame_is_available_without_second_capture(self, _):
         self.assertEqual(self.probe(10000, 10800).result(self.BAR), (self.BUTTON, 800))
 
+    def test_pending_frame_does_not_block_control_path(self):
+        probe = self.probe(10000, 10800)
+        probe.after = Future()
+        with patch.object(probe.after, "result", side_effect=AssertionError("不应等待截图")):
+            self.assertIsNone(probe.result(self.BAR))
+
     @patch.object(opening, "now_ms", return_value=10900)
     def test_unmodified_early_and_stale_frames_are_rejected(self, _):
         self.assertIsNone(self.probe(10000, 10800, changed=False).result(self.BAR))

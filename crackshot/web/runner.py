@@ -23,7 +23,7 @@ from ..notify import Notifier
 from ..reservation import ReservationUnavailable, read_reservation
 from ..scheduler import TaskRunner
 from ..show_details import inspect_show_details
-from ..timeutil import LOCAL_TZ, now_ms
+from ..timeutil import LOCAL_TZ, epoch_ms, now_ms, parse_local
 from . import db
 
 log = logging.getLogger("crackshot.web.runner")
@@ -78,6 +78,7 @@ class RunManager:
         self._lock = threading.RLock()
         self.device_busy: Dict[str, Optional[int]] = {}  # serial → run_id，None 表示设备操作
         self.run_task: Dict[int, int] = {}        # run_id → task_id
+        self.run_trigger_ms: Dict[int, int] = {}  # 已启动的定时任务使用启动时的时钟偏移
         self.task_running: Set[int] = set()
         self.cancel_events: Dict[int, threading.Event] = {}  # run_id → event
         self._online_cache: Dict[str, str] = {}   # serial → model
@@ -119,7 +120,9 @@ class RunManager:
         with self._lock:
             for serial, run_id in self.device_busy.items():
                 if run_id is not None:
-                    out.append({"serial": serial, "run_id": run_id})
+                    out.append({"serial": serial, "run_id": run_id,
+                                "task_id": self.run_task.get(run_id),
+                                "trigger_at_ms": self.run_trigger_ms.get(run_id)})
         return out
 
     def is_task_running(self, task_id: int) -> bool:
@@ -336,6 +339,11 @@ class RunManager:
         attempts = 0
         try:
             settings = db.get_settings()
+            if not dry_run or not manual:
+                trigger_ms, _, _ = schedule_times(task, settings)
+                if not manual:
+                    with self._lock:
+                        self.run_trigger_ms[run_id] = trigger_ms
             adb_path = find_adb(None)
             if not adb_path:
                 raise RuntimeError("电脑上未找到 adb")
@@ -356,7 +364,6 @@ class RunManager:
             runner = TaskRunner(global_cfg, task_cfg, adb, dev, notifier,
                                 evidence_dir, dry_run=dry_run,
                                 stop_check=cancel.is_set, phase_cb=phase,
-                                guard_only=dry_run and not manual,
                                 recording_path=self.recording_path(run_id))
             outcome = runner.run(ignore_schedule=manual)
             attempts = runner.grabber.attempts
@@ -379,12 +386,18 @@ class RunManager:
                 self.run_task.pop(run_id, None)
                 self.task_running.discard(task["id"])
                 self.cancel_events.pop(run_id, None)
+                self.run_trigger_ms.pop(run_id, None)
 
 
 def schedule_times(task: dict, settings: Dict[str, str]):
     """开售、预热和窗口结束；与执行器使用相同的配置和时钟偏移。"""
     cfg = db.task_config_from_row(task, settings)
-    sale = cfg.on_sale_ms() + int(settings.get("clock_offset_ms", "0"))
+    sale = cfg.on_sale_ms()
+    if task.get("status") in SCHEDULED_STATUSES and not task.get("scheduled_dry_run"):
+        calibrated = task.get("calibrated_at")
+        if not calibrated or sale != epoch_ms(parse_local(calibrated)):
+            raise ValueError("正式排程时间与页面校准时间不一致，请重新校准并确认排程")
+    sale += int(settings.get("clock_offset_ms", "0"))
     return sale, sale - cfg.prewarm_minutes * 60_000, sale + cfg.max_retry_seconds * 1000
 
 

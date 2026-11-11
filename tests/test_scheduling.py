@@ -4,8 +4,10 @@ import json
 import tempfile
 import time
 import unittest
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -84,6 +86,10 @@ class SearchTests(unittest.TestCase):
                 + node("杭州站", "tour_city_name")))
         self.assertTrue(navigator.is_target_detail(detail("杭州"), self.task))
         self.assertFalse(navigator.is_target_detail(detail("宁波"), self.task))
+        other_stop = device_with_xml(lambda: node(f"宁波 · {SHOW}", "info_v2_title_tv1")
+                                    + node(rid="purchase_status_bar")
+                                    + node("杭州站 今天15:00开抢", "count_sell_time"))
+        self.assertFalse(navigator.is_target_detail(other_stop, self.task))
 
     def test_real_name_notice_closes_only_the_acknowledgement(self):
         dev = device_with_xml(lambda: node(children=
@@ -111,6 +117,24 @@ class SearchTests(unittest.TestCase):
             self.assertTrue(navigator._ensure_home(adb, dev))
             self.assertTrue(navigator.open_search(dev, adb))
         self.assertEqual(taps, [(110, 2300), (625, 160)])
+
+    def test_preheat_exits_old_retry_dialog_before_returning_home(self):
+        scenes = [
+            node("确认购买") + node("抢票人数太多啦，继续尝试别放弃")
+            + node("继续尝试", "damai_theme_dialog_confirm_btn", "[195,1429][981,1549]")
+            + node("返回重新选购", "damai_theme_dialog_cancel_btn", "[363,1594][813,1660]"),
+            node("上一场演出", "info_v2_title") + node(rid="purchase_status_bar"),
+            node("演唱会", "bricks_ball_name"),
+        ]
+        actions = []
+        dev = device_with_xml(lambda: scenes[len(actions)])
+        adb = SimpleNamespace(is_damai_foreground=lambda: True,
+                              tap=lambda *xy: actions.append(xy),
+                              back=lambda: actions.append("back"))
+        with patch.object(navigator.time, "sleep", return_value=None), \
+             patch.object(navigator, "sleep_jitter", return_value=None):
+            self.assertTrue(navigator._ensure_home(adb, dev, task=self.task))
+        self.assertEqual(actions, [(588, 1627), "back"])
 
     def test_search_and_detail_match_official_title_with_quotes(self):
         task = TaskConfig("test", "张杰1982开往未·LIVE", SALE, ["688"], city="南京")
@@ -264,10 +288,11 @@ class SchedulingTests(unittest.TestCase):
     def xml(self):
         if self.state == "detail":
             countdown = (node("杭州站 明天15:00开抢", "count_sell_time", "[10,200][900,400]")
-                         if self.now < SALE_MS else
-                         node("立即预订", "purchase_status_bar", "[600,2000][1000,2250]"))
+                         if self.now < SALE_MS else "")
+            purchase = node("已预约" if countdown else "立即预订",
+                            "purchase_status_bar", "[600,2000][1000,2250]")
             return node(children=node(f"{SHOW} · 杭州站", "info_v2_title", "[10,50][900,200]")
-                        + countdown + node("2026.11.28-11.29 约120分钟", "info_v2_time_and_duration_tv")
+                        + countdown + purchase + node("2026.11.28-11.29 约120分钟", "info_v2_time_and_duration_tv")
                         + node("488", "info_v2_price_left") + node("888", "info_v2_price_right"))
         return node("请完成验证" if self.state == "captcha" else "首页")
 
@@ -380,26 +405,46 @@ class SchedulingTests(unittest.TestCase):
         self.now += 86_400_000
         self.manager._tick()
         self.assertEqual(len(db.list_runs(task_id=tid)), 1)
+        self.request("POST", f"/api/tasks/{tid}/schedule",
+                     {"on_sale_at": "2026-11-09 15:01"}, 409)
+        db.set_setting("clock_offset_ms", "125")
         task = self.request("POST", f"/api/tasks/{tid}/schedule", {"on_sale_at": SALE})
         self.assertEqual(task["prewarm_at"], "2026-11-09 14:55:00")
+        self.assertEqual(task["trigger_at_ms"], SALE_MS + 125)
+        with patch.object(web_app.extractor, "status", return_value={}):
+            overview = self.request("GET", "/api/overview")
+        self.assertEqual(overview["server_now_ms"], self.now)
+        self.assertEqual(overview["next_up"][0]["trigger_at_ms"], SALE_MS + 125)
         self.manager._tick()
         self.assertEqual(len(db.list_runs(task_id=tid)), 1)
 
-        self.now += 1
+        self.now += 126
         self.state = "home"
         self.interrupt_at = self.now + 5000
-        self.manager._tick()
-        run = self.wait_run(tid)
+        active_countdown = []
+        emit_phase = scheduler.TaskRunner._phase
+
+        def inspect_phase(task_runner, name):
+            emit_phase(task_runner, name)
+            db.set_setting("clock_offset_ms", "500")
+            active_countdown.extend(self.request("GET", "/api/overview")["next_up"])
+
+        with patch.object(scheduler.TaskRunner, "_phase", inspect_phase), \
+             patch.object(web_app.extractor, "status", return_value={}):
+            self.manager._tick()
+            run = self.wait_run(tid)
+        self.assertEqual([(item["status"], item["trigger_at_ms"]) for item in active_countdown],
+                         [("grabbing", SALE_MS + 125)])
         self.assertEqual(run["outcome"], "needs_human")
-        self.assertEqual(self.recording_starts, [SALE_MS - 300000])
+        self.assertEqual(self.recording_starts, [SALE_MS - 300000 + 125])
         self.assertEqual(len(self.evidence_times), 1)
         self.assertEqual(self.recording_stops, [self.evidence_times[0] + 60_000])
         video = self.request("GET", f"/api/runs/{run['id']}")["recording_url"]
         self.assertEqual(self.request("GET", video, expected=206, raw=True,
                                       headers=((b"range", b"bytes=0-3"),)), b"test")
-        self.assertEqual(self.nav_times[1], SALE_MS - 300000)
+        self.assertEqual(self.nav_times[1], SALE_MS - 300000 + 125)
         self.assertEqual(len(self.nav_times), 3)  # calibration, initial navigation, guard recovery
-        self.assertEqual([t[0] for t in self.taps], [SALE_MS])
+        self.assertEqual(self.taps, [(SALE_MS + 125, (800, 2125))])
         self.manager._tick()
         self.assertEqual(len(db.list_runs(task_id=tid)), 2)
 
@@ -427,28 +472,46 @@ class SchedulingTests(unittest.TestCase):
         self.assertEqual((task["session"], task["price_tiers"]), ("2026-11-28 19:30", ["588"]))
         self.assertEqual(task["calibration"]["reservation_price"], "588")
 
-    def test_confirm_uses_current_selection_without_reading_price_or_date(self):
+    def test_confirm_uses_reservation_without_reading_cards_or_total(self):
         self.now = SALE_MS
         task = TaskConfig("test", SHOW, SALE, ["688"], session="2026-11-28")
         enabled = False
+        overlay = False
         dev = device_with_xml(lambda: node(children=node("确定", bounds="[50,450][100,550]")
             + node(rid="id_sku_bottom_bar_container", children=
-                   node("确定", bounds="[600,2100][1000,2240]", enabled=enabled))))
+                   node(rid="btn_buy_view", bounds="[600,2100][1000,2240]", enabled=enabled)
+                   + (node(rid="view_translucent") if overlay else ""))))
         adb = self.adb()
-        adb.screencap_raw = lambda: self.fail("可直接使用确定控件，不应截图核对")
+        adb.screencap_raw = dev.fast_screenshot = lambda: self.fail("应直接使用确定控件")
         instance = grabber.Grabber(adb, dev, task, SimpleNamespace(), Path(self.tmp.name))
         instance.deadline_ms = SALE_MS + 10000
         self.assertIsNone(instance._from_tier_sheet())
         self.assertEqual(self.taps, [])
         enabled = True
+        overlay = True
+        dev.refresh()
+        self.assertIsNone(instance._from_tier_sheet())
+        self.assertEqual(self.taps, [])
+        overlay = False
         dev.refresh()
         clicked_at = self.now
         self.assertIsNone(instance._from_tier_sheet())
         self.assertEqual(self.taps, [(clicked_at, (800, 2170))])
 
-    def test_order_retry_shares_cooldown_and_caps_submissions(self):
+    def test_calibration_scopes_countdown_to_the_target_city(self):
+        self.now = SALE_MS - 3600000
+        wrong_city = node(rid="city_card", children=node("宁波站", "tour_city_name")
+                          + node("今天16:00开抢", "count_sell_time"))
+        local = node("今天 19:30 演出，今天 15:00:00 开抢", "count_sell_time")
+        dev = device_with_xml(lambda: node(rid="purchase_status_bar") + wrong_city + local)
+        self.assertEqual(scheduler.read_page_sell_time(dev, "杭州"), SALE_MS)
+        dev = device_with_xml(lambda: node(rid="purchase_status_bar")
+                             + wrong_city + node("宁波站 今天16:00开抢", "count_sell_time"))
+        self.assertIsNone(scheduler.read_page_sell_time(dev, "杭州"))
+
+    def test_order_retry_shares_cooldown_and_continues_until_deadline(self):
         self.now = SALE_MS
-        task = TaskConfig("test", SHOW, SALE, ["688"])
+        task = TaskConfig("test", SHOW, SALE, ["688"], max_attempts=2)
         submit = node("立即提交", bounds="[700,2100][1000,2240]")
         retry = node("继续尝试", bounds="[500,1200][800,1320]") + node("返回重新选购")
         dev = device_with_xml(lambda: submit + node(clazz="android.widget.CheckBox", checked=True)
@@ -461,20 +524,26 @@ class SchedulingTests(unittest.TestCase):
         adb.tap = tap
         instance = grabber.Grabber(adb, dev, task, SimpleNamespace(critical=messages.append),
                                    Path(self.tmp.name))
-        instance.deadline_ms = SALE_MS + 30000
+        instance.deadline_ms = SALE_MS + 90000
         self.state = "order"
         def attempt(offset):
             self.now = SALE_MS + offset
             dev.refresh(fast=True)
             return instance._attempt()
-        for offset in (0, 799, 800, 1599, 1600, 2400, 3200, 4000, 4800):
+        for offset in (0, 799, 800, 1599):
             self.assertIsNone(attempt(offset))
-        self.assertEqual(attempt(5600), grabber.GrabOutcome.NEEDS_HUMAN)
-        self.assertEqual(self.taps, [(i * 800, (850, 2170) if i % 2 == 0 else (650, 1260))
-                                     for i in range(7)])
-        self.assertIn("已提交 4 次", messages[0])
+        self.assertEqual(instance._run_until_end(SALE_MS), grabber.GrabOutcome.TIMEOUT)
+        self.assertGreater(instance._order_submissions, 4)
+        self.assertGreater(instance.attempts, task.max_attempts)
+        self.assertGreaterEqual(self.now, instance.deadline_ms)
+        self.assertTrue(all(t < 90000 for t, _ in self.taps))
+        self.assertTrue(all(b[0] - a[0] >= 800 for a, b in zip(self.taps, self.taps[1:])))
+        self.assertEqual([point for _, point in self.taps],
+                         [(850, 2170) if i % 2 == 0 else (650, 1260)
+                          for i in range(len(self.taps))])
+        self.assertEqual(messages, [])
 
-    def test_order_refresh_is_clicked_once_while_full_page_notice_stays_open(self):
+    def test_order_refresh_repeats_with_cooldown_while_known_notice_stays_open(self):
         self.now = SALE_MS
         task = TaskConfig("test", SHOW, SALE, ["688"])
         enabled = False
@@ -495,8 +564,29 @@ class SchedulingTests(unittest.TestCase):
         self.now = refresh_at + 800
         self.assertIsNone(instance._attempt())
         self.now = refresh_at + 2000
+        self.assertIsNone(instance._attempt())
+        self.assertEqual(self.taps, [(refresh_at + delay, (540, 1725))
+                                     for delay in (0, 800, 2000)])
+
+    def test_retry_stops_at_unknown_page_without_tapping_or_returning(self):
+        self.now = SALE_MS
+        task = TaskConfig("test", SHOW, SALE, ["688"])
+        dev = device_with_xml(lambda: node("继续尝试") + node("返回重新选购")
+                             if self.state == "retry" else node("新页面提示"))
+        adb = self.adb()
+        adb.tap = lambda *p: self.taps.append((self.now, p))
+        adb.back = lambda: self.fail("未知页面不应自动返回")
+        instance = grabber.Grabber(adb, dev, task, SimpleNamespace(critical=lambda _: None),
+                                   Path(self.tmp.name))
+        instance.deadline_ms = SALE_MS + 90000
+        self.state = "retry"
+        self.assertIsNone(instance._attempt())
+        self.state = "unknown"
+        self.now += 2100
+        dev.refresh(fast=True)
         self.assertEqual(instance._attempt(), grabber.GrabOutcome.NEEDS_HUMAN)
-        self.assertEqual(self.taps, [(refresh_at, (540, 1725))])
+        self.assertEqual(len(self.taps), 1)
+        self.assertEqual(len(self.evidence_times), 1)
 
     def test_order_failure_notices_stop_without_dismissing(self):
         self.now = SALE_MS
@@ -539,8 +629,11 @@ class SchedulingTests(unittest.TestCase):
         tid = self.create_draft()
         self.request("POST", f"/api/tasks/{tid}/schedule", {"on_sale_at": SALE, "dry_run": True})
         self.now += 1
-        self.manager._tick()
-        run = self.wait_run(tid)
+        with self.assertLogs("crackshot.grabber", level="INFO") as messages:
+            self.manager._tick()
+            run = self.wait_run(tid)
+        self.assertTrue(any("定时首击 (800, 2125)，距触发时刻 +0ms" in line
+                            for line in messages.output))
         self.assertEqual((run["outcome"], run["dry_run"]), ("guard_verified", 1))
         self.assertEqual(self.nav_times, [SALE_MS - 300000])
         self.assertEqual(self.taps, [])
@@ -553,7 +646,7 @@ class SchedulingTests(unittest.TestCase):
     def test_probe_starts_before_sale_and_keeps_loading_page_open(self):
         self.now = SALE_MS - 3000
         self.state = "detail"
-        task = TaskConfig("test", SHOW, SALE, ["688"], city="杭州")
+        task = TaskConfig("test", SHOW, SALE, ["688"], city="杭州", blind_tap=False)
         probe_times, backs = [], []
         adb = self.adb()
         adb.back = lambda: backs.append(self.now)
@@ -571,13 +664,13 @@ class SchedulingTests(unittest.TestCase):
         instance = grabber.Grabber(adb, dev, task, notifier, Path(self.tmp.name),
                                    tier_reader=lambda *_: self.fail("不应解析缺货登记页"))
         self.assertEqual(instance.run(SALE_MS, verify_detail=True), "sold_out")
-        self.assertEqual(probe_times, [SALE_MS - 750])
-        self.assertEqual([tap[0] for tap in self.taps], [SALE_MS + 100])
+        self.assertEqual(probe_times, [SALE_MS - 750, SALE_MS + 100])
+        self.assertEqual([tap[0] for tap in self.taps], [SALE_MS + 950])
         self.assertEqual(backs, [])
 
     def test_pre_sale_button_is_rechecked_before_clicking(self):
         self.now = SALE_MS - 750
-        task = TaskConfig("test", SHOW, SALE, ["688"], city="杭州")
+        task = TaskConfig("test", SHOW, SALE, ["688"], city="杭州", blind_tap=False)
         def xml():
             button = "立即预订" if self.now < SALE_MS else "缺货登记"
             return node(children=node(f"{SHOW} · 杭州站", "info_v2_title")
@@ -587,6 +680,62 @@ class SchedulingTests(unittest.TestCase):
                                    Path(self.tmp.name), stop_check=lambda: self.now > SALE_MS + 300)
         self.assertEqual(instance.run(SALE_MS, verify_detail=True), "sold_out")
         self.assertEqual(self.taps, [])
+
+    def test_first_click_returns_from_early_reservation_then_verifies_and_completes_order(self):
+        self.now = SALE_MS - 2000
+        self.state = "detail"
+        task = TaskConfig("test", SHOW, SALE, ["688"], city="杭州", session="2026-11-28 19:30")
+        reads, backs = [], []
+
+        def xml():
+            reads.append(self.now)
+            if self.state == "detail":
+                if self.now < SALE_MS + 400:
+                    return (node(f"{SHOW} · 杭州站", "info_v2_title")
+                            + node("今天15:00开抢", "count_sell_time")
+                            + node("已预约", "purchase_status_bar", "[600,2000][1000,2250]"))
+                return self.xml()
+            return {
+                "reserve": node("预约想看票档"),
+                "tier": node("票档", "tv_price_name") + node(rid="id_sku_bottom_bar_container",
+                             children=node(rid="btn_buy_view", bounds="[600,2100][1000,2240]")),
+                "order": node("立即提交", bounds="[700,2100][1000,2240]")
+                         + node(clazz="android.widget.CheckBox", checked=True),
+                "success": node("立即支付"),
+            }[self.state]
+
+        adb = self.adb()
+        def tap(*point):
+            self.taps.append((self.now, point))
+            self.state = {"detail": "reserve" if len(self.taps) == 1 else "tier",
+                          "tier": "order", "order": "success"}[self.state]
+        def back():
+            backs.append(self.now)
+            self.state = "detail"
+        adb.tap, adb.back = tap, back
+        adb.screencap_raw = lambda: self.fail("定时首击与原生控件均不需要截图")
+        instance = grabber.Grabber(adb, device_with_xml(xml), task,
+                                   SimpleNamespace(success=lambda _: None), Path(self.tmp.name))
+        self.assertEqual(instance.run(SALE_MS, verify_detail=True), "success")
+        self.assertEqual(reads[:2], [SALE_MS - 1750, SALE_MS])
+        self.assertEqual(backs, [SALE_MS])
+        self.assertEqual(self.taps[0], (SALE_MS, (800, 2125)))
+        self.assertGreaterEqual(self.taps[1][0], SALE_MS + 400)
+        self.assertEqual([point for _, point in self.taps[2:]], [(800, 2170), (850, 2170)])
+
+    def test_first_click_stops_on_late_page_change_or_cancellation(self):
+        task = TaskConfig("test", SHOW, SALE, ["688"], city="杭州")
+        for cancelled in (False, True):
+            with self.subTest(cancelled=cancelled):
+                self.now = SALE_MS - 2000
+                self.state = "detail"
+                self.interrupt_at = None if cancelled else SALE_MS - 1800
+                instance = grabber.Grabber(self.adb(), device_with_xml(self.xml), task,
+                                           SimpleNamespace(critical=lambda _: None), Path(self.tmp.name),
+                                           stop_check=lambda: cancelled and self.now >= SALE_MS - 25)
+                self.assertEqual(instance.run(SALE_MS, verify_detail=True),
+                                 "cancelled" if cancelled else "needs_human")
+                self.assertEqual(self.taps, [])
 
     def test_opening_uses_ready_parallel_frame_without_another_capture(self):
         self.now = SALE_MS + 800
@@ -601,9 +750,69 @@ class SchedulingTests(unittest.TestCase):
         instance._sale_at_ms = SALE_MS
         instance._verify_detail = True
         instance._opening_probe = SimpleNamespace(
-            result=lambda _: ((340, 2210, 1020, 2350), 800), close=lambda: None)
+            result=lambda _, **kw: ((340, 2210, 1020, 2350), 800), close=lambda: None)
         self.assertIsNone(instance._attempt())
         self.assertEqual([tap[0] for tap in self.taps], [SALE_MS + 800])
+
+    def test_tier_confirm_does_not_wait_for_inflight_purchase_capture(self):
+        self.now = SALE_MS + 315
+        self.state = "detail"
+        task = TaskConfig("test", SHOW, SALE, ["688"], city="杭州")
+        dev = device_with_xml(lambda: (
+            node(f"{SHOW} · 杭州站", "info_v2_title") + node(rid="purchase_status_bar", bounds="[320,2200][1050,2360]")
+            if self.state == "detail" else node("票档", "tv_price_name")
+            + node(rid="id_sku_bottom_bar_container", children=node(
+                rid="btn_buy_view", bounds="[720,2230][1050,2360]"))))
+        adb = self.adb()
+        adb.tap = lambda *xy: self.taps.append(xy)
+        entered, release = Event(), Event()
+        def capture():
+            entered.set()
+            if not release.wait(2):
+                self.fail("视觉线程阻塞了主链路")
+            return (340, 2210, 1020, 2350), "异步原始帧", self.now, self.now
+        instance = grabber.Grabber(adb, dev, task, SimpleNamespace(), Path(self.tmp.name))
+        instance.deadline_ms = SALE_MS + 10000
+        instance._sale_at_ms = SALE_MS
+        instance._verify_detail = True
+        with ThreadPoolExecutor(max_workers=1) as pool, patch.object(instance, "_locate_purchase_button", capture):
+            instance._purchase_pool = pool
+            try:
+                self.assertIsNone(instance._attempt())
+                self.assertTrue(entered.wait(.5))
+                future = instance._purchase_scan[1]
+                self.state = "tier"
+                dev.refresh(fast=True)
+                self.assertIsNone(instance._attempt())
+                self.assertEqual(self.taps, [(885, 2295)])
+                self.assertFalse(future.done())
+                self.assertIsNone(instance._purchase_scan)
+            finally:
+                release.set()
+
+    def test_visual_purchase_requires_new_detail_snapshot_and_matching_button_width(self):
+        self.now = SALE_MS + 500
+        task = TaskConfig("test", SHOW, SALE, ["688"], city="杭州")
+        bounds = (320, 2200, 1050, 2360)
+        dev = device_with_xml(lambda: node(f"{SHOW} · 杭州站", "info_v2_title")
+                             + node(rid="purchase_status_bar", bounds="[320,2200][1050,2360]"))
+        instance = grabber.Grabber(self.adb(), dev, task, SimpleNamespace(), Path(self.tmp.name))
+        instance.deadline_ms = SALE_MS + 10000
+        instance._sale_at_ms = SALE_MS
+        instance._verify_detail = True
+        narrow = Future()
+        narrow.set_result(((720, 2220, 1040, 2350), "异步原始帧", SALE_MS, self.now))
+        instance._purchase_scan = (bounds, narrow)
+        self.assertIsNone(instance._attempt())
+        self.assertEqual(self.taps, [])
+        wide = Future()
+        wide.set_result(((340, 2210, 1020, 2350), "异步原始帧", SALE_MS, self.now))
+        instance._purchase_scan = (bounds, wide)
+        self.assertIsNone(instance._from_detail(self.now - 1))
+        self.assertEqual(self.taps, [])
+        dev.refresh(fast=True)
+        self.assertIsNone(instance._attempt())
+        self.assertEqual(len(self.taps), 1)
 
     def test_calibration_never_overwrites_existing_device_owner(self):
         tid = self.create_draft()

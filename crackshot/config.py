@@ -37,7 +37,7 @@ class TaskConfig:
     prewarm_minutes: int = 5            # 提前几分钟校验页面（人工应已停在详情页）
     arm_lead_seconds: int = 2           # 开票前几秒进入紧轮询
     max_retry_seconds: int = 90         # 开票后抢票窗口长度
-    max_attempts: int = 40              # 整轮尝试次数硬上限
+    max_attempts: int = 40              # 进入订单流程前的尝试上限；订单重试由时间窗口控制
     retry_backoff_ms: Tuple[int, int] = (400, 1200)
     poll_interval_ms: Tuple[int, int] = (120, 280)   # 按钮状态轮询抖动区间
     confirm_wait_ms: Tuple[int, int] = (80, 160)     # 连续点击之间的抖动
@@ -48,8 +48,7 @@ class TaskConfig:
     captcha_texts: List[str] = field(default_factory=lambda: list(DEFAULT_CAPTCHA_TEXTS))
     error_texts: List[str] = field(default_factory=lambda: list(DEFAULT_ERROR_TEXTS))
     error_button_texts: List[str] = field(default_factory=lambda: list(DEFAULT_ERROR_BUTTON_TEXTS))
-    # 开票瞬间对倒计时按钮位置盲点连点（点未激活按钮无害，模拟真人狂点）；
-    # 仅对 countdown 类文案启用，缺货登记这类会打开别的页面，不盲点
+    # 开票前锁定目标页底部坐标，到点只直点一次；后续重新识别按钮。
     blind_tap: bool = True
     blind_tap_texts: List[str] = field(default_factory=lambda: ["即将开抢", "即将开售"])
 

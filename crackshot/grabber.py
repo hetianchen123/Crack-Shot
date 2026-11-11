@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import io
 import logging
+import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -30,11 +32,13 @@ from . import vision
 log = logging.getLogger("crackshot.grabber")
 
 _BUY_PROBE_LEAD_MS = 750
+_FIXED_BUY_PREP_LEAD_MS = 1750
 _BUY_TRANSITION_MS = 2000
 _FIXED_BUY_TRANSITION_MS = 150
+_FIXED_BUY_MAX_LATE_MS = 100
 _UNKNOWN_TRANSITION_EXTRA_MS = 2000
 _ORDER_ACTION_INTERVAL_MS = 800
-_MAX_ORDER_SUBMISSIONS = 4
+_VISUAL_RESULT_MAX_AGE_MS = 1000
 
 
 def _rand(span: int) -> int:
@@ -79,7 +83,9 @@ class Grabber:
         self._capture_raw = (getattr(adb, "screencap_raw", None)
                              if button_finder is vision.find_buy_button else None)
         self._opening_probe = None
-        self._fixed_buy_bounds = None
+        self._purchase_pool = None
+        self._purchase_scan = None
+        self._recover_early_reservation = False
         self.deadline_ms = 0
         self.attempts = 0
         self._sale_at_ms = 0
@@ -90,6 +96,7 @@ class Grabber:
         self._queue_until_ms = 0
         self._last_order_action_ms = 0
         self._order_submissions = 0
+        self._order_active = False
         self._await_continue_page = False
         self._verify_detail = False
         self._waiting_for_button = False
@@ -121,10 +128,12 @@ class Grabber:
 
     def _tap(self, x: int, y: int) -> None:
         """统一点击入口：注入点击后立刻失效控件快照，下次查询重新 dump。"""
+        self._discard_purchase_vision()
         self.adb.tap(x, y)
         self.device.refresh()
 
     def _back(self) -> None:
+        self._discard_purchase_vision()
         self.adb.back()
         self.device.refresh()
 
@@ -141,68 +150,79 @@ class Grabber:
                  self.task.max_retry_seconds, self.task.price_tiers[:1])
 
         # 坐标在开票前读取，到点路径只等待时钟并注入点击。
-        if verify_detail and now_ms() < on_sale_ms:
-            outcome = self._timed_first_click(on_sale_ms)
-            if outcome:
-                return outcome
-        if (not self._fixed_buy_bounds and verify_detail and self._capture_raw
-                and on_sale_ms - now_ms() >= 1000):
-            self._opening_probe = OpeningProbe(self._capture_raw, on_sale_ms)
+        self._purchase_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="purchase-vision")
         try:
+            if verify_detail and self.task.blind_tap and now_ms() < on_sale_ms:
+                outcome = self._timed_first_click(on_sale_ms)
+                if outcome:
+                    return outcome
+            elif verify_detail and self._capture_raw and on_sale_ms - now_ms() >= 1000:
+                self._opening_probe = OpeningProbe(self._capture_raw, on_sale_ms)
             return self._run_until_end(on_sale_ms)
         finally:
-            if self._opening_probe:
-                self._opening_probe.close()
-                self._opening_probe = None
+            self._discard_purchase_vision()
+            self._purchase_pool.shutdown(wait=False, cancel_futures=True)
+            self._purchase_pool = None
 
     def _timed_first_click(self, on_sale_ms: int) -> Optional[str]:
         """预热确认目标页面和坐标；开票瞬间不读控件、不截图。"""
         from .navigator import is_target_detail
 
-        if self._stop_requested():
-            return GrabOutcome.CANCELLED
+        while True:
+            if self._stop_requested():
+                return GrabOutcome.CANCELLED
+            left_ms = on_sale_ms - _FIXED_BUY_PREP_LEAD_MS - now_ms()
+            if left_ms <= 0:
+                break
+            time.sleep(min(0.05, left_ms / 1000))
+        check_started = now_ms()
+        if not self.adb.is_damai_foreground():
+            self.notify.critical("定时点击准备失败：大麦不在前台")
+            return GrabOutcome.NEEDS_HUMAN
         self.device.refresh(fast=True)
         snap = recognize(self.device, self.task)
         if not is_target_detail(self.device, self.task, snap):
             self.notify.critical("定时点击准备失败：当前不在目标演出详情页")
             return GrabOutcome.NEEDS_HUMAN
-        button = self.device.find(self.task.buy_texts)
         bar = self.device.find_by_id("purchase_status_bar")
-        target = bar or button
-        if not target:
-            self.notify.critical("定时点击准备失败：未找到底部按钮坐标")
-            return GrabOutcome.NEEDS_HUMAN
-        self._fixed_buy_bounds = target.bounds
-        log.info("定时坐标已就绪 %s；到点直接点击，不等待截图或控件读取", target.center)
-        while now_ms() < on_sale_ms:
+        if not bar or not bar.enabled or now_ms() >= on_sale_ms:
+            log.info("未能在开票前锁定坐标，改为等待可购按钮")
+            return None
+        if self._known_unavailable_button(bar):
+            log.info("购买栏显示不可购买，等待页面状态更新")
+            return None
+        log.info("定时坐标已就绪 %s，开票前核验耗时 %dms；到点直接点击",
+                 bar.center, now_ms() - check_started)
+        while True:
             if self._stop_requested():
                 return GrabOutcome.CANCELLED
-            left_s = (on_sale_ms - now_ms()) / 1000
-            if left_s > 0.15:
-                time.sleep(min(0.05, left_s - 0.15))
-            # 最后 150ms 自旋等待（sleep 粒度 ~10ms，自旋到 ~1ms）
-        self._entered = True
-        return self._click_fixed_buy()
-
-    def _click_fixed_buy(self) -> Optional[str]:
-        if self._stop_requested():
-            return GrabOutcome.CANCELLED
-        if now_ms() >= self.deadline_ms:
+            left_ms = on_sale_ms - now_ms()
+            if left_ms <= 0:
+                break
+            time.sleep(min(0.05, left_ms / 1000))
+        started = now_ms()
+        if not 0 <= started - on_sale_ms <= _FIXED_BUY_MAX_LATE_MS:
+            # 时钟调整或线程唤醒过晚时，不再使用之前锁定的坐标。
+            return None
+        if started >= self.deadline_ms:
             return GrabOutcome.TIMEOUT
         if self.dry_run:
-            log.info("[dry-run] 定时坐标已验证 %s，未点击", self._fixed_buy_bounds)
+            log.info("[dry-run] 定时首击 %s，距触发时刻 %+dms，未点击",
+                     bar.center, started - on_sale_ms)
             return "guard_verified"
-        left, top, right, bottom = self._fixed_buy_bounds
-        point = ((left + right) // 2, (top + bottom) // 2)
-        started = now_ms()
-        self._tap(*point)
+        self._entered = True
+        try:
+            self._tap(*bar.center)
+        except AdbError as exc:
+            log.warning("定时点击结果未知，先核对页面：%s", exc)
         ended = now_ms()
         self._waiting_for_button = False
         self._needs_backoff = False
         self._buy_transition_until_ms = ended + _FIXED_BUY_TRANSITION_MS
         self._unknown_after_buy = False
+        self._recover_early_reservation = True
         log.info("定时坐标点击 %s，距开票 %+dms 发出，ADB 点击 %dms（无截图、无元素等待）",
-                 point, started - self._sale_at_ms, ended - started)
+                 bar.center, started - on_sale_ms, ended - started)
         return None
 
     def _run_until_end(self, on_sale_ms: int) -> str:
@@ -211,7 +231,7 @@ class Grabber:
             if self._stop_requested():
                 log.info("收到取消请求，停止抢票")
                 return GrabOutcome.CANCELLED
-            if self.attempts >= self.task.max_attempts and not (self._submit_until_ms or self._queue_until_ms):
+            if self.attempts >= self.task.max_attempts and not self._order_active:
                 log.info("达到尝试次数上限 %s，停止", self.task.max_attempts)
                 return GrabOutcome.TIMEOUT
             until_probe_ms = probe_at_ms - now_ms()
@@ -242,6 +262,12 @@ class Grabber:
         self._needs_backoff = True
         probe_started_ms = now_ms()
         snap = recognize(self.device, self.task)
+        if snap.state != PageState.DETAIL:
+            self._discard_purchase_vision()
+        if snap.state in (PageState.ORDER_CONFIRM, PageState.ORDER_RETRY, PageState.QUEUE):
+            self._order_active = True
+        elif snap.state in (PageState.DETAIL, PageState.TIER_SHEET):
+            self._order_active = False
 
         if snap.state == PageState.CAPTCHA:
             self._evidence("captcha")
@@ -281,6 +307,7 @@ class Grabber:
                 if first_unknown or now_ms() < transition_until:
                     return self._wait_for_button()
                 if snap.state == PageState.UNKNOWN:
+                    self._evidence("unknown_page")
                     self.notify.critical("购买点击后仍无法识别页面，请在手机上核对")
                     return GrabOutcome.NEEDS_HUMAN
                 log.info("购买点击后仍在详情页，重新核对购买按钮")
@@ -292,6 +319,15 @@ class Grabber:
             return GrabOutcome.SUCCESS
 
         if snap.state == PageState.RESERVE:
+            if self._recover_early_reservation:
+                if self._stop_requested():
+                    return GrabOutcome.CANCELLED
+                log.info("定时首击进入预约页，返回详情等待正式开售")
+                self._recover_early_reservation = False
+                self._back()
+                self._buy_transition_until_ms = now_ms() + _FIXED_BUY_TRANSITION_MS
+                self._needs_backoff = False
+                return None
             # 未开票演出的预约登记页：说明开票时间未到或配置有误
             self.notify.critical(
                 f"[{self.task.name}] 该演出未开票（当前为预约登记页），"
@@ -302,7 +338,7 @@ class Grabber:
             self.notify.info("演练已停止：页面已离开详情页")
             return GrabOutcome.OFF_PAGE
 
-        if self._await_continue_page and snap.state in (PageState.ORDER_RETRY, PageState.UNKNOWN):
+        if self._await_continue_page and snap.state == PageState.UNKNOWN:
             return self._wait_for_order(self._last_order_action_ms + _BUY_TRANSITION_MS)
         self._await_continue_page = False
         if snap.state == PageState.ORDER_RETRY:
@@ -332,18 +368,21 @@ class Grabber:
             self._needs_backoff = False
             return self._from_detail(probe_started_ms)
         if snap.state == PageState.TIER_SHEET:
+            self._recover_early_reservation = False
             return self._from_tier_sheet()
         if snap.state == PageState.ORDER_CONFIRM:
             return self._from_order_confirm()
 
-        # UNKNOWN：可能是票务须知弹窗挡住（首进城市站必弹），先尝试关闭
         from .navigator import dismiss_ticket_notice
         if dismiss_ticket_notice(self.device, self.adb):
             return None
-        # 其余：失败弹窗先关掉，再尝试返回详情页
-        log.info("页面状态 %s（命中: %s），尝试退出重试", snap.state.value, snap.matched)
-        self._dismiss_error_and_back()
-        return None
+        if snap.state == PageState.ERROR_DIALOG:
+            log.info("已识别失败弹窗（%s），关闭后重试", snap.matched)
+            self._dismiss_error_and_back()
+            return None
+        self._evidence("unknown_page")
+        self.notify.critical(f"出现未登记的页面（{snap.state.value}），已停止，请人工核对")
+        return GrabOutcome.NEEDS_HUMAN
 
     # ---- 各页面处理 ----------------------------------------------------
 
@@ -355,13 +394,14 @@ class Grabber:
     def _detail_sold_out(self) -> bool:
         if now_ms() < self._sale_at_ms or self._sale_countdown_present():
             return False
-        button = self.device.find(SOLD_OUT_TEXTS)
-        bar = self.device.find_by_id("purchase_status_bar")
-        if not button or not bar:
+        return self._known_unavailable_button(self.device.find_by_id("purchase_status_bar"))
+
+    def _known_unavailable_button(self, bar) -> bool:
+        if not bar:
             return False
-        x, y = button.center
         left, top, right, bottom = bar.bounds
-        return left <= x <= right and top <= y <= bottom
+        return any(left <= x <= right and top <= y <= bottom
+                   for x, y in (n.center for n in self.device.find_all(SOLD_OUT_TEXTS)))
 
     def _wait_for_button(self) -> None:
         self._needs_backoff = False
@@ -369,28 +409,23 @@ class Grabber:
         until_sale_ms = self._sale_at_ms - now_ms()
         if until_sale_ms > 0:
             time.sleep(min(0.15, until_sale_ms / 1000))
+        elif self._buy_transition_until_ms or self._purchase_scan or self._opening_probe:
+            time.sleep(0.01)
         else:
-            if self._fixed_buy_bounds:
-                time.sleep(0.01)
-            else:
-                sleep_jitter(self.task.poll_interval_ms)
+            sleep_jitter(self.task.poll_interval_ms)
 
     def _from_detail(self, probe_started_ms: int) -> Optional[str]:
         """详情页：优先识别可购文字，自绘按钮在底部购买栏内用视觉定位。"""
         self._waiting_for_button = True
-        if self._fixed_buy_bounds and now_ms() >= self._sale_at_ms:
-            # 首击后若仍在目标详情页，仅沿用本次预热坐标重试；不等截图。
-            bar = self.device.find_by_id("purchase_status_bar")
-            if bar and bar.bounds == self._fixed_buy_bounds:
-                return self._click_fixed_buy()
+        if probe_started_ms < self._sale_at_ms <= now_ms():
+            return None
         buy = self.device.find(self.task.buy_texts)
         wait = buy is None and (
             self._sale_countdown_present()
             or self.device.find(self.task.wait_texts + ["立即预约", "已预约"]) is not None
         )
-        if wait and probe_started_ms < self._sale_at_ms <= now_ms():
-            # 跨过开票点的读数可能仍是旧倒计时，马上取下一帧。
-            return None
+        if wait:
+            self._discard_purchase_scan()
         if not wait:
             bbox = buy.bounds if buy and buy.enabled else None
             ui_read_ms = now_ms()
@@ -401,12 +436,13 @@ class Grabber:
                     return self._wait_for_button()
                 bar = self.device.find_by_id("purchase_status_bar")
                 ui_read_ms = now_ms()
-                bbox, source, capture_ms = self._locate_purchase_button(bar)
+                bbox, source, capture_ms = self._purchase_candidate(bar, probe_started_ms)
                 if bbox and bar:
                     l, t, r, b = bar.bounds
                     x1, y1, x2, y2 = bbox
                     bbox = (max(l, x1), max(t, y1), min(r, x2), min(b, y2))
-                    if bbox[2] - bbox[0] < 40 or bbox[3] - bbox[1] < 30:
+                    # 详情购买按钮占据大部分购买栏；选票页的确定按钮只在右侧。
+                    if bbox[2] - bbox[0] < max(40, (r - l) * .60) or bbox[3] - bbox[1] < 30:
                         bbox = None
             if bbox:
                 until_sale_ms = self._sale_at_ms - now_ms()
@@ -422,15 +458,13 @@ class Grabber:
                     log.info("[dry-run] 已识别可购按钮 %s，未点击", bbox)
                     return "guard_verified"
                 self._waiting_for_button = False
+                self._recover_early_reservation = False
                 tap_start_ms = now_ms()
-                x, y = vision.tap_button_jitter(self.adb, bbox)
+                x, y = vision.random_point(bbox)
+                self._tap(x, y)
                 tap_end_ms = now_ms()
-                self.device.refresh()
                 self._buy_transition_until_ms = tap_end_ms + _BUY_TRANSITION_MS
                 self._unknown_after_buy = False
-                if self._opening_probe:
-                    self._opening_probe.close()
-                    self._opening_probe = None
                 log.info("点击已激活购买按钮 (%s,%s)，距开票 %+dms 发出，"
                          "控件核验 %dms，%s采样 %dms，核验后至点击 %dms，ADB 点击 %dms",
                          x, y, tap_start_ms - self._sale_at_ms, ui_read_ms - probe_started_ms,
@@ -438,45 +472,80 @@ class Grabber:
                 return None
         return self._wait_for_button()
 
-    def _locate_purchase_button(self, bar):
+    def _discard_purchase_scan(self):
+        if self._purchase_scan:
+            self._purchase_scan[1].cancel()
+            self._purchase_scan = None
+
+    def _discard_purchase_vision(self):
+        self._discard_purchase_scan()
+        if self._opening_probe:
+            self._opening_probe.close()
+            self._opening_probe = None
+
+    def _purchase_candidate(self, bar, probe_started_ms):
+        """只取已完成的视觉结果，并用画面采集后的控件树核对当前页面。"""
+        if self._verify_detail and (not bar or not bar.enabled):
+            self._discard_purchase_vision()
+            return None, "", 0
         if bar and self._opening_probe:
-            candidate = self._opening_probe.result(bar.bounds)
+            candidate = self._opening_probe.result(bar.bounds, observed_at_ms=probe_started_ms)
             if candidate:
                 return candidate[0], "并行原始帧", candidate[1]
+            if not self._opening_probe.ready:
+                return None, "", 0
+            self._discard_purchase_vision()
+
+        bounds = bar.bounds if bar else None
+        if self._purchase_scan:
+            previous_bounds, future = self._purchase_scan
+            if previous_bounds != bounds:
+                self._discard_purchase_scan()
+            elif not future.done():
+                return None, "", 0
+            else:
+                bbox, source, started, finished = future.result()
+                if probe_started_ms < finished:
+                    return None, "", 0
+                self._purchase_scan = None
+                if now_ms() - finished <= _VISUAL_RESULT_MAX_AGE_MS:
+                    return bbox, source, finished - started
+        if self._purchase_pool:
+            self._purchase_scan = (bounds, self._purchase_pool.submit(self._locate_purchase_button))
+        return None, "", 0
+
+    def _locate_purchase_button(self):
+        """视觉线程通过独立的 ADB 截图读取画面，不读控件树或点击。"""
         start = now_ms()
         if self._capture_raw:
             try:
                 bbox, _ = vision.opening_frame(self._capture_raw())
-                return bbox, "原始帧", now_ms() - start
+                return bbox, "异步原始帧", start, now_ms()
             except (AdbError, OSError, ValueError) as exc:
                 log.debug("原始截图不可用，回退 PNG: %s", exc)
         try:
-            bbox = self._find_button(self.device.fast_screenshot())
-        except Exception as exc:  # noqa: BLE001 —— fast 失败再试 adb PNG
-            log.debug("fast 截图不可用，回退 adb PNG: %s", exc)
-            try:
-                bbox = self._find_button(self.adb.screencap_bytes())
-            except (AdbError, OSError, ValueError) as exc2:
-                log.debug("视觉检测异常: %s", exc2)
-                bbox = None
-        return bbox, "PNG", now_ms() - start
+            bbox = self._find_button(self.adb.screencap_bytes())
+        except (AdbError, OSError, ValueError, subprocess.SubprocessError) as exc:
+            log.debug("视觉检测异常: %s", exc)
+            bbox = None
+        return bbox, "异步 PNG", start, now_ms()
 
     def _tier_pixels(self):
+        try:
+            return np.asarray(self.device.fast_screenshot())
+        except Exception as exc:  # noqa: BLE001
+            log.debug("选票快速截图不可用：%s", exc)
         if self._capture_raw:
             try:
                 width, height, data = self._capture_raw()
                 return np.frombuffer(data, dtype=np.uint8).reshape(height, width, 4)
             except (AdbError, OSError, ValueError) as exc:
                 log.debug("选票原始帧不可用，改用 PNG: %s", exc)
-        try:
-            return np.asarray(self.device.fast_screenshot())
-        except Exception as exc:  # noqa: BLE001
-            log.debug("fast 截图不可用，回退 adb PNG: %s", exc)
-            with Image.open(io.BytesIO(self.adb.screencap_bytes())) as image:
-                return np.asarray(image.convert("RGB"))
+        with Image.open(io.BytesIO(self.adb.screencap_bytes())) as image:
+            return np.asarray(image.convert("RGB"))
 
     def _from_tier_sheet(self) -> Optional[str]:
-        """使用预约选中项，直接点可用的「确定」。"""
+        """沿用预约选中项，点击可用的「确定」。"""
         if now_ms() < self._tier_confirm_until_ms:
             return self._wait_for_order(self._tier_confirm_until_ms)
         started = now_ms()
@@ -512,6 +581,8 @@ class Grabber:
 
     def _from_order_confirm(self) -> Optional[str]:
         """确认购买页：核对观演人已选中 → 点「立即提交」→ 观察结果。"""
+        if now_ms() >= self.deadline_ms:
+            return GrabOutcome.TIMEOUT
         # 观演人：要求至少一个 checkbox 选中（预填后默认第一位已选中）；
         # 未选中则点第一位观演人
         try:
@@ -546,8 +617,6 @@ class Grabber:
             return GrabOutcome.CANCELLED
         if now_ms() >= self.deadline_ms:
             return GrabOutcome.TIMEOUT
-        if self._order_submissions >= _MAX_ORDER_SUBMISSIONS:
-            return self._order_retry_exhausted()
 
         # 点击返回结果不明时仍视为已提交，直到页面明确给出重试结果。
         self._last_order_action_ms = now_ms()
@@ -559,8 +628,8 @@ class Grabber:
         return None
 
     def _continue_order(self, action_text: str) -> Optional[str]:
-        if self._order_submissions >= _MAX_ORDER_SUBMISSIONS:
-            return self._order_retry_exhausted()
+        if now_ms() >= self.deadline_ms:
+            return GrabOutcome.TIMEOUT
         if now_ms() - self._last_order_action_ms < _ORDER_ACTION_INTERVAL_MS:
             return self._wait_for_order(self.deadline_ms)
         button = self.device.find([action_text])
@@ -568,7 +637,7 @@ class Grabber:
             return self._wait_for_order(self.deadline_ms)
         if self._stop_requested():
             return GrabOutcome.CANCELLED
-        if now_ms() >= self.deadline_ms or self.attempts >= self.task.max_attempts:
+        if now_ms() >= self.deadline_ms:
             return GrabOutcome.TIMEOUT
         self._last_order_action_ms = now_ms()
         self._await_continue_page = True
@@ -578,12 +647,9 @@ class Grabber:
         log.info("已点「%s」，等待页面就绪及订单操作冷却", action_text)
         return None
 
-    def _order_retry_exhausted(self) -> str:
-        self.notify.critical(f"已提交 {_MAX_ORDER_SUBMISSIONS} 次，订单仍未成功，请人工处理")
-        return GrabOutcome.NEEDS_HUMAN
-
     def _wait_for_order(self, until_ms: int) -> Optional[str]:
         if now_ms() >= until_ms:
+            self._evidence("order_status_timeout")
             self.notify.critical("订单状态仍未明确，请在手机上核对")
             return GrabOutcome.NEEDS_HUMAN
         self._waiting_for_button = True
