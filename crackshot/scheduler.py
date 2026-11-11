@@ -9,11 +9,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-from .adb import Adb
+from .adb import Adb, AdbError
 from .config import GlobalConfig, TaskConfig
 
 from .device import Device
 from .grabber import GrabOutcome, Grabber
+from .login import LoginError, ensure_logged_in
 from .notify import Notifier
 from .pages import PageState, recognize
 from .recording import record_screen
@@ -60,6 +61,7 @@ class TaskRunner:
         stop_check=None,
         phase_cb=None,
         recording_path: Optional[Path] = None,
+        read_login_credentials=None,
     ):
         self.cfg = cfg
         self.task = task
@@ -70,6 +72,7 @@ class TaskRunner:
         self.stop_check = stop_check
         self.phase_cb = phase_cb
         self.recording_path = recording_path
+        self.read_login_credentials = read_login_credentials
         self.grabber = Grabber(adb, device, task, notifier, evidence_root,
                                dry_run, stop_check=stop_check)
 
@@ -90,6 +93,11 @@ class TaskRunner:
                 return GrabOutcome.TIMEOUT
         if self.stop_check and self.stop_check():
             return GrabOutcome.CANCELLED
+        login_failure = self._prepare_login()
+        if login_failure:
+            return login_failure
+        if not ignore_schedule and now_ms() >= on_sale_ms + self.task.max_retry_seconds * 1000:
+            return GrabOutcome.TIMEOUT
 
         until_sale = 0 if ignore_schedule else max(0, on_sale_ms - now_ms()) // 1000
         limit_seconds = (until_sale + self.task.max_retry_seconds + self.task.queue_wait_seconds
@@ -108,10 +116,25 @@ class TaskRunner:
                                 stop_check=tail_should_stop)
         return outcome
 
+    def _prepare_login(self) -> Optional[str]:
+        log.info("预热前检查大麦登录状态")
+        try:
+            self.adb.wake()
+            logged_in_now = ensure_logged_in(self.adb, self.device, self.read_login_credentials,
+                                             task=self.task, stop_check=self.stop_check)
+        except (AdbError, LoginError) as exc:
+            if self.stop_check and self.stop_check():
+                return GrabOutcome.CANCELLED
+            self.notifier.critical(f"预热登录检查未通过：{exc}")
+            return GrabOutcome.NEEDS_HUMAN
+        if self.stop_check and self.stop_check():
+            return GrabOutcome.CANCELLED
+        log.info("自动登录成功，继续预热" if logged_in_now else "大麦已登录，继续预热")
+        return None
+
     def _run_active(self, on_sale_ms: int, ignore_schedule: bool) -> str:
         if ignore_schedule:
             log.info("手动模式：跳过定时")
-            self.adb.wake()
             on_page = self._open_damai()
             if self.stop_check and self.stop_check():
                 return GrabOutcome.CANCELLED

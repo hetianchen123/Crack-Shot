@@ -19,12 +19,14 @@ from typing import Dict, Optional, Set
 from ..adb import Adb, find_adb
 from ..config import GlobalConfig
 from ..device import Device
+from ..login import LoginError
 from ..notify import Notifier
 from ..reservation import ReservationUnavailable, read_reservation
 from ..scheduler import TaskRunner
 from ..show_details import inspect_show_details
 from ..timeutil import LOCAL_TZ, epoch_ms, now_ms, parse_local
 from . import db
+from .credentials import CredentialError, DeviceCredentials
 
 log = logging.getLogger("crackshot.web.runner")
 SCHEDULED_STATUSES = {"scheduled", "waiting_device", "conflict"}
@@ -75,6 +77,7 @@ class RunManager:
     def __init__(self, db_path: Path):
         self.evidence_root = db_path.parent / "evidence"
         self.recording_root = db_path.parent / "recordings" / db_path.name
+        self.credentials = DeviceCredentials(db_path)
         self._lock = threading.RLock()
         self.device_busy: Dict[str, Optional[int]] = {}  # serial → run_id，None 表示设备操作
         self.run_task: Dict[int, int] = {}        # run_id → task_id
@@ -361,10 +364,17 @@ class RunManager:
                     db.set_task_status(task["id"], "grabbing")
                     db.add_event(task["id"], run_id, "info", "进入抢票阶段")
 
+            def read_login_credentials():
+                try:
+                    return self.credentials.read(device)
+                except CredentialError as exc:
+                    raise LoginError(str(exc)) from None
+
             runner = TaskRunner(global_cfg, task_cfg, adb, dev, notifier,
                                 evidence_dir, dry_run=dry_run,
                                 stop_check=cancel.is_set, phase_cb=phase,
-                                recording_path=self.recording_path(run_id))
+                                recording_path=self.recording_path(run_id),
+                                read_login_credentials=read_login_credentials)
             outcome = runner.run(ignore_schedule=manual)
             attempts = runner.grabber.attempts
         except Exception as exc:  # noqa: BLE001

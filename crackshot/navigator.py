@@ -24,10 +24,12 @@ log = logging.getLogger("crackshot.navigator")
 
 # 每步之间的基础等待（页面过渡），再叠加随机抖动
 _STEP_SLEEP = (0.8, 1.5)
+LOGIN_CHALLENGES = ["请完成验证", "滑动验证", "滑块验证", "拖动滑块", "安全验证", "人机验证"]
 
 
 class LoginState(Enum):
     SIGNED_IN = "signed_in"
+    SIGNED_OUT = "signed_out"
     CONSENT_REQUIRED = "consent_required"
     PHONE_FORM = "phone_form"
 
@@ -142,15 +144,26 @@ def _signed_in_profile(device: Device) -> bool:
                 and not device.find_by_id("mine_ticket_login_tip"))
 
 
-def open_phone_login(adb: Adb, device: Device, *, accept_agreement: bool = False) -> LoginState:
+def open_phone_login(adb: Adb, device: Device, *, accept_agreement: bool = False,
+                     check_only: bool = False, task: Optional[TaskConfig] = None,
+                     stop_check=None) -> LoginState:
     """检查「我的」页，未登录时打开手机号入口。"""
+    def check_interruption():
+        if stop_check and stop_check():
+            raise AdbError("登录检查已取消")
+        if device.exists_contains_any(LOGIN_CHALLENGES):
+            raise AdbError("大麦要求安全验证，请在手机上完成")
+
     if not adb.is_damai_foreground() and not _bring_foreground(adb):
         raise AdbError("未能打开大麦")
     _snapshot_retry(device)
+    check_interruption()
     if not (device.find_by_id("tv_mine_order") or device.find_by_id("aliuser_main_content")
-            or _login_agreement(device) or _phone_login_form(device)):
-        if not _ensure_home(adb, device):
+            or device.find_by_id("login_more_title") or _login_agreement(device)
+            or _phone_login_form(device)):
+        if not _ensure_home(adb, device, task=task, stop_check=stop_check):
             raise AdbError("未找到大麦首页")
+        check_interruption()
         mine = device.find(["我的"])
         if not mine or not mine.enabled:
             raise AdbError("未找到大麦「我的」入口")
@@ -160,6 +173,7 @@ def open_phone_login(adb: Adb, device: Device, *, accept_agreement: bool = False
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline and adb.is_damai_foreground():
         device.refresh()
+        check_interruption()
         if _login_agreement(device):
             if not accept_agreement:
                 return LoginState.CONSENT_REQUIRED
@@ -169,13 +183,18 @@ def open_phone_login(adb: Adb, device: Device, *, accept_agreement: bool = False
                 accepted_agreement = True
         elif _phone_login_form(device):
             return LoginState.PHONE_FORM
-        elif device.find_by_id("aliuser_main_content"):
-            phone = device.find_by_id("login_third_account_btn")
+        elif device.find_by_id("aliuser_main_content") or device.find_by_id("login_more_title"):
+            if check_only:
+                return LoginState.SIGNED_OUT
+            phone = (device.find(["手机号登录", "手机号码登录", "手机号密码登录"])
+                     or device.find_by_id("login_third_account_btn"))
             if phone and phone.enabled and not opened_phone:
                 adb.tap(*phone.center)
                 opened_phone = True
         elif device.find_by_id("tv_mine_order"):
             entry = device.find(["立即登录"])
+            if check_only and (entry or device.find_by_id("mine_ticket_login_tip")):
+                return LoginState.SIGNED_OUT
             if entry and entry.enabled and not opened_login:
                 adb.tap(*entry.center)
                 opened_login = True

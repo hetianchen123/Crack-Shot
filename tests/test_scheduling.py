@@ -11,7 +11,7 @@ from threading import Event
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from crackshot import grabber, navigator, scheduler
+from crackshot import grabber, login, navigator, scheduler
 from crackshot.login import LoginError, login_with_password
 from crackshot.device import Device, _parse_nodes
 from crackshot.config import TaskConfig
@@ -178,6 +178,14 @@ class SearchTests(unittest.TestCase):
         with patch.object(navigator.time, "sleep", return_value=None):
             self.assertEqual(navigator.open_phone_login(adb, dev), navigator.LoginState.SIGNED_IN)
 
+    def test_login_check_recognizes_more_methods_page_without_tapping(self):
+        dev = device_with_xml(lambda: node("更多登录方式", "login_more_title")
+                              + node("手机号登录", "login_third_account_btn"))
+        adb = SimpleNamespace(is_damai_foreground=lambda: True,
+                              tap=lambda *_: self.fail("仅检查时不应点击登录"))
+        self.assertEqual(navigator.open_phone_login(adb, dev, check_only=True),
+                         navigator.LoginState.SIGNED_OUT)
+
     def test_password_login_fills_configured_phone_after_switching_saved_account(self):
         def control(name, label="", **kwargs):
             return node(label, f"cn.damai:id/{name}", **kwargs)
@@ -252,6 +260,7 @@ class SchedulingTests(unittest.TestCase):
             patch.object(grabber, "now_ms", lambda: self.now),
             patch.object(scheduler, "time", SimpleNamespace(sleep=self.advance)),
             patch.object(scheduler, "record_screen", self.fake_record_screen),
+            patch.object(scheduler, "ensure_logged_in", return_value=False),
             patch.object(grabber, "time", SimpleNamespace(sleep=self.advance)),
             patch.object(grabber, "sleep_jitter", lambda _: self.advance(0.2)),
             patch.object(runner, "find_adb", return_value="fake-adb"),
@@ -642,6 +651,47 @@ class SchedulingTests(unittest.TestCase):
         self.assertEqual(self.now, SALE_MS)
         self.manager._tick()
         self.assertEqual(len(db.list_runs(task_id=tid)), 1)
+
+    def test_scheduled_preheat_checks_login_before_navigation(self):
+        cases = [
+            (navigator.LoginState.SIGNED_IN, None, None, "guard_verified"),
+            (navigator.LoginState.SIGNED_OUT, ("10000000000", "fixture"), None, "guard_verified"),
+            (navigator.LoginState.SIGNED_OUT, None, None, "needs_human"),
+            (navigator.LoginState.SIGNED_OUT, ("10000000000", "fixture"),
+             LoginError("大麦要求短信验证"), "needs_human"),
+        ]
+        for state, saved, error, expected in cases:
+            with self.subTest(state=state, credentials_configured=bool(saved), outcome=expected):
+                self.now = SALE_MS - 300001
+                self.state = "home"
+                self.nav_times.clear()
+                tid = self.create_draft()
+                self.request("POST", f"/api/tasks/{tid}/schedule", {"on_sale_at": SALE, "dry_run": True})
+                self.now += 1
+
+                def auto_login(*_args, **_kwargs):
+                    self.assertEqual(self.nav_times, [])
+                    self.assertIn("fake-phone", self.manager.device_busy)
+                    if error:
+                        raise error
+                    return True
+
+                with patch.object(scheduler, "ensure_logged_in", login.ensure_logged_in), \
+                     patch.object(login, "open_phone_login", return_value=state) as check, \
+                     patch.object(self.manager.credentials, "read", return_value=saved) as read, \
+                     patch.object(login, "login_with_password", side_effect=auto_login) as perform:
+                    self.manager._tick()
+                    result = self.wait_run(tid)
+                self.assertEqual(result["outcome"], expected)
+                self.assertTrue(check.call_args.kwargs["check_only"])
+                if state == navigator.LoginState.SIGNED_IN:
+                    read.assert_not_called()
+                else:
+                    self.assertEqual(read.call_args.args[0]["id"], self.device_id)
+                    self.assertEqual(read.call_args.args[0]["serial"], "fake-phone")
+                self.assertEqual(perform.call_count, int(saved is not None))
+                self.assertEqual(self.nav_times, [SALE_MS - 300000] if expected == "guard_verified" else [])
+                self.assertEqual(self.taps, [])
 
     def test_probe_starts_before_sale_and_keeps_loading_page_open(self):
         self.now = SALE_MS - 3000
