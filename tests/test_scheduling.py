@@ -92,13 +92,56 @@ class SearchTests(unittest.TestCase):
         self.assertFalse(navigator.is_target_detail(other_stop, self.task))
 
     def test_real_name_notice_closes_only_the_acknowledgement(self):
-        dev = device_with_xml(lambda: node(children=
+        taps = []
+        dev = device_with_xml(lambda: node("详情页", "info_v2_title") if taps else node(children=
             node("实名制观演") + node("预选实名观演人", bounds="[100,1300][900,1400]")
             + node("知道了", bounds="[100,1420][900,1500]")))
-        taps = []
         self.assertEqual(recognize(dev, self.task).state, PageState.TICKET_NOTICE)
-        self.assertTrue(navigator.dismiss_ticket_notice(dev, SimpleNamespace(tap=lambda *xy: taps.append(xy))))
+        with patch.object(navigator.time, "sleep", return_value=None):
+            self.assertTrue(navigator.dismiss_ticket_notice(dev, SimpleNamespace(tap=lambda *xy: taps.append(xy))))
         self.assertEqual(taps, [(500, 1460)])
+
+    def test_detail_navigation_scrolls_announcement_until_acknowledged(self):
+        for initially_enabled in (False, True):
+            with self.subTest(initially_enabled=initially_enabled):
+                swipes, taps = [], []
+                closed = False
+
+                def xml():
+                    detail = node(f"{SHOW} · 杭州站", "info_v2_title") + node(rid="purchase_status_bar")
+                    if closed:
+                        return detail
+                    return detail + node("二开公告", bounds="[400,540][680,640]") + node(
+                        "确认并知悉", bounds="[190,1620][890,1750]",
+                        enabled=initially_enabled or len(swipes) >= 2)
+
+                def tap(*xy):
+                    nonlocal closed
+                    taps.append((len(swipes), xy))
+                    closed = len(swipes) >= 2
+
+                dev = device_with_xml(xml)
+                adb = SimpleNamespace(is_damai_foreground=lambda: True, tap=tap,
+                                      shell=lambda *args: swipes.append(args),
+                                      back=lambda: self.fail("公告关闭前不应返回"))
+                with patch.object(navigator.time, "sleep", return_value=None):
+                    self.assertTrue(navigator.navigate_to_detail(adb, dev, self.task))
+                self.assertEqual(len(swipes), 2)
+                for command, action, x1, y1, x2, y2, _ in swipes:
+                    self.assertEqual((command, action, x1, x2), ("input", "swipe", "540", "540"))
+                    self.assertTrue(640 < int(y2) < int(y1) < 1620)
+                self.assertEqual(taps, ([(1, (540, 1685))] if initially_enabled else [])
+                                 + [(2, (540, 1685))])
+
+    def test_cancel_during_announcement_scroll_stops_before_acknowledgement(self):
+        dev = device_with_xml(lambda: node("二开公告", bounds="[400,540][680,640]")
+                              + node("确认并知悉", bounds="[190,1620][890,1750]"))
+        swipes = []
+        adb = SimpleNamespace(shell=lambda *args: swipes.append(args),
+                              tap=lambda *_: self.fail("取消后不能点击确认"))
+        with patch.object(navigator.time, "sleep", return_value=None):
+            self.assertFalse(navigator.dismiss_ticket_notice(dev, adb, stop_check=lambda: bool(swipes)))
+        self.assertEqual(len(swipes), 1)
 
     def test_search_switches_from_mine_to_verified_home(self):
         scenes = [

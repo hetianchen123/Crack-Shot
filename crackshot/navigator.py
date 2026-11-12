@@ -25,6 +25,9 @@ log = logging.getLogger("crackshot.navigator")
 # 每步之间的基础等待（页面过渡），再叠加随机抖动
 _STEP_SLEEP = (0.8, 1.5)
 LOGIN_CHALLENGES = ["请完成验证", "滑动验证", "滑块验证", "拖动滑块", "安全验证", "人机验证"]
+_ANNOUNCEMENT_TITLES = ["二开公告", "二次开售公告", "开售公告", "售票公告", "购票公告",
+                        "演出公告", "购票须知", "票务须知"]
+_NOTICE_SCROLL_LIMIT = 8
 
 
 class LoginState(Enum):
@@ -405,16 +408,54 @@ def is_target_detail(device: Device, task: TaskConfig, snap: Optional[PageSnapsh
                    if any(hint in n.resource_id for hint in ("venue_name", "venue_address"))))
 
 
-def dismiss_ticket_notice(device: Device, adb: Adb) -> bool:
-    """只关闭已识别的提示，保留用户预选的观演人。"""
+def _announcement_swipe(device: Device, button: Element):
+    """从已识别的公告标题和确认按钮推导两者之间的正文区域。"""
+    if _label(button) != "确认并知悉":
+        return None
+    title = device.find(_ANNOUNCEMENT_TITLES)
+    if not title:
+        return None
+    left, button_top, right, _ = button.bounds
+    top = title.bounds[3]
+    x = button.center[0]
+    height = button_top - top
+    if not left <= title.center[0] <= right or height < 80:
+        return None
+    inset = max(12, height // 6)
+    # 手指向上划，让正文向下滚，触点始终位于标题和按钮之间。
+    return x, button_top - inset, x, top + inset
+
+
+def dismiss_ticket_notice(device: Device, adb: Adb, *, stop_check=None) -> bool:
+    """滚动需阅读的公告，确认提示消失后再返回成功。"""
     btn = ticket_notice_button(device)
-    if not btn or not btn.enabled:
+    if not btn:
         return False
-    log.info("关闭详情页提示：%s @%s", _label(btn), btn.center)
-    adb.tap(*btn.center)
-    time.sleep(.20)
-    device.refresh(fast=True)
-    return True
+    scroll_count = 0
+    for _ in range(_NOTICE_SCROLL_LIMIT):
+        if (stop_check and stop_check()) or device.exists_contains_any(LOGIN_CHALLENGES):
+            return False
+        swipe = _announcement_swipe(device, btn) if btn else None
+        if swipe:
+            scroll_count += 1
+            adb.shell("input", "swipe", *(str(n) for n in swipe), "320")
+            time.sleep(.25)
+            device.refresh(fast=True)
+            btn = ticket_notice_button(device)
+            if (stop_check and stop_check()) or device.exists_contains_any(LOGIN_CHALLENGES):
+                return False
+        if btn and btn.enabled:
+            adb.tap(*btn.center)
+        time.sleep(.30)
+        device.refresh(fast=True)
+        btn = ticket_notice_button(device)
+        if not btn and device.elements():
+            log.info("已关闭详情页提示，公告滚动 %d 次", scroll_count)
+            return True
+        if btn and not swipe:
+            break
+    log.warning("详情页提示仍未关闭，公告滚动 %d 次", scroll_count)
+    return False
 
 
 def _enter_city_card(device: Device, adb: Adb, task: TaskConfig) -> bool:
@@ -446,6 +487,12 @@ def navigate_to_detail(adb: Adb, device: Device, task: TaskConfig,
                        notify: Optional[Notifier] = None, stop_check=None) -> bool:
     """完整导航：确保大麦前台 → 搜索 → 点结果 → 校验目标单站。"""
     stopped = stop_check or (lambda: False)
+
+    def clear_notice():
+        state = recognize(device, task).state
+        return state != PageState.CAPTCHA and (state != PageState.TICKET_NOTICE
+                or dismiss_ticket_notice(device, adb, stop_check=stopped))
+
     if stopped():
         return False
     if not adb.is_damai_foreground():
@@ -454,9 +501,8 @@ def navigate_to_detail(adb: Adb, device: Device, task: TaskConfig,
             return False
 
     _snapshot_retry(device)
-    if recognize(device, task).state == PageState.CAPTCHA:
+    if not clear_notice():
         return False
-    dismiss_ticket_notice(device, adb)
     if is_target_detail(device, task):
         return True
 
@@ -465,7 +511,8 @@ def navigate_to_detail(adb: Adb, device: Device, task: TaskConfig,
     show = _show_key(task.show_name)
     if _is_tour(device) and show and any(show in _show_key(_label(n)) for n in device.elements()):
         _enter_city_card(device, adb, task)
-        dismiss_ticket_notice(device, adb)
+        if not clear_notice():
+            return False
         if is_target_detail(device, task):
             return True
 
@@ -484,9 +531,8 @@ def navigate_to_detail(adb: Adb, device: Device, task: TaskConfig,
         if stopped():
             return False
         _snapshot_retry(device)
-        if recognize(device, task).state == PageState.CAPTCHA:
+        if not clear_notice():
             return False
-        dismiss_ticket_notice(device, adb)
         if is_target_detail(device, task):
             log.info("已到达目标演出详情页: %s %s", task.show_name, task.city)
             return True

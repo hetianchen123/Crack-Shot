@@ -181,6 +181,11 @@ class Grabber:
             return GrabOutcome.NEEDS_HUMAN
         self.device.refresh(fast=True)
         snap = recognize(self.device, self.task)
+        if snap.state == PageState.TICKET_NOTICE:
+            outcome = self._from_ticket_notice()
+            if outcome:
+                return outcome
+            snap = recognize(self.device, self.task)
         if not is_target_detail(self.device, self.task, snap):
             self.notify.critical("定时点击准备失败：当前不在目标演出详情页")
             return GrabOutcome.NEEDS_HUMAN
@@ -273,6 +278,8 @@ class Grabber:
             self._evidence("captcha")
             self.notify.critical("出现验证码/风控验证，请人工处理（脚本已停止）")
             return GrabOutcome.NEEDS_HUMAN
+        if snap.state == PageState.TICKET_NOTICE:
+            return self._from_ticket_notice()
 
         if now_ms() < self._sale_at_ms and snap.state != PageState.DETAIL:
             return self._wait_for_button()
@@ -373,9 +380,6 @@ class Grabber:
         if snap.state == PageState.ORDER_CONFIRM:
             return self._from_order_confirm()
 
-        from .navigator import dismiss_ticket_notice
-        if dismiss_ticket_notice(self.device, self.adb):
-            return None
         if snap.state == PageState.ERROR_DIALOG:
             log.info("已识别失败弹窗（%s），关闭后重试", snap.matched)
             self._dismiss_error_and_back()
@@ -385,6 +389,24 @@ class Grabber:
         return GrabOutcome.NEEDS_HUMAN
 
     # ---- 各页面处理 ----------------------------------------------------
+
+    def _from_ticket_notice(self) -> Optional[str]:
+        from .navigator import dismiss_ticket_notice
+
+        closed = dismiss_ticket_notice(
+            self.device, self.adb,
+            stop_check=lambda: self._stop_requested() or now_ms() >= self.deadline_ms)
+        if self._stop_requested():
+            return GrabOutcome.CANCELLED
+        if now_ms() >= self.deadline_ms:
+            return GrabOutcome.TIMEOUT
+        if closed:
+            self._waiting_for_button = True
+            self._needs_backoff = False
+            return None
+        self._evidence("ticket_notice")
+        self.notify.critical("详情页公告未能关闭，请在手机上查看")
+        return GrabOutcome.NEEDS_HUMAN
 
     def _sold_out(self, reason: str) -> str:
         log.info("停止抢票：%s", reason)
